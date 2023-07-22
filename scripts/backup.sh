@@ -46,6 +46,8 @@ fi
 email_send() {
   if [ -n "$3" ]; then
     ATTACHMENT="-a $3 --"
+  else 
+    ATTACHMENT=""
   fi
 
   if EMAIL_RESULT=$(printf "$2" | EMAIL="$SMTP_FROM_NAME <$SMTP_FROM>" mutt -F "$MUTTRC" -s "$1" $ATTACHMENT "$BACKUP_EMAIL_TO" 2>&1); then

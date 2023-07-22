@@ -21,8 +21,8 @@ AUTH_METHOD=LOGIN
 # BACKUP_EMAIL_TO=
 
 
-# Initialize email settings
-email_init() {
+# Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
+if [ "$1" == "email" -o -n "$BACKUP_EMAIL_NOTIFY" ] && [ ! -f "$MUTTRC" ]; then
   if [ "$SMTP_SECURITY" == "force_tls" ]; then
     MUTT_SSL_KEY=ssl_force_tls
     SMTP_PROTO=smtps
@@ -36,7 +36,7 @@ set smtp_url="${SMTP_PROTO}://${SMTP_USERNAME}@${SMTP_HOST}:${SMTP_PORT}"
 set smtp_pass="${SMTP_PASSWORD}"
 EOF
   printf "Finished configuring email.\n" >$LOG
-}
+fi
 
 
 # Send an email
@@ -143,64 +143,80 @@ make_backup() {
 
 
 ##############################################################################################
+# Main Backup 
 
-
-
-# Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "$1" == "email" -o -n "$BACKUP_EMAIL_NOTIFY" ] && [ ! -f "$MUTTRC" ]; then
-  email_init
-fi
-# Initialize rclone if BACKUP=rclone and $(which rclone) is blank
-if [ "$1" == "rclone" -a -z "$(which rclone)" ]; then
-  rclone_init
-fi
-
-
-# Handle E-mail Backup
-if [ "$1" == "email" ]; then
-  printf "Running email backup\n" >> $LOG
-
-  # Backup and send e-mail
-  RESULT=$(make_backup)
-  FILENAME=$(basename $RESULT)
-  BODY=$(email_body $FILENAME)
-  email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
-
-
-# Handle rclone Backup
-elif [ "$1" == "rclone" ]; then
-  printf "Running rclone backup\n" >> $LOG
-
-  # Only run if $BACKUP_RCLONE_CONF has been setup
-  if [ -s "$BACKUP_RCLONE_CONF" ]; then
-    RESULT=$(make_backup)
-
-    # Sync with rclone
-    REMOTE=$(rclone --config $BACKUP_RCLONE_CONF listremotes | head -n 1)
-    ERR=$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)
-    SYNC_STATUS=$?
-
-    if [ $SYNC_STATUS -ne 0 ]; then
-       printf "Failed to sync:\n  %b\n" "$ERR" >> $LOG
-    fi
-
-    # Send email if configured
-    if [ -n "$BACKUP_EMAIL_NOTIFY" ]; then
-      if [ $SYNC_STATUS -eq 0 ]; then
-        email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed"
-      else
-        email_send "$SMTP_FROM_NAME - rclone backup failed" "$ERR"
+backup(){
+  
+  METHOD=$1
+  RESULT=$2
+  case $METHOD in
+    local)
+      printf "Running local backup\n" >> $LOG
+      if [ -n "$BACKUP_EMAIL_NOTIFY" ]; then
+        email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
       fi
+
+      ;;
+    email)
+      # Handle E-mail Backup
+      printf "Running email backup\n" >> $LOG
+      # Backup and send e-mail
+      FILENAME=$(basename $RESULT)
+      BODY=$(email_body $FILENAME)
+      email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
+      ;;
+
+    rclone)
+      # Handle rclone Backup
+      printf "Running rclone backup\n" >> $LOG
+      # Initialize rclone if BACKUP=rclone and $(which rclone) is blank
+      if [ "$1" == "rclone" -a -z "$(which rclone)" ]; then
+        rclone_init
+      fi
+
+      # Only run if $BACKUP_RCLONE_CONF has been setup
+      if [ -s "$BACKUP_RCLONE_CONF" ]; then
+        # Sync with rclone
+        REMOTE=$(rclone --config $BACKUP_RCLONE_CONF listremotes | head -n 1)
+        ERR=$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)
+        SYNC_STATUS=$?
+
+        if [ $SYNC_STATUS -ne 0 ]; then
+          printf "Failed to sync:\n  %b\n" "$ERR" >> $LOG
+        fi
+
+        # Send email if configured
+        if [ -n "$BACKUP_EMAIL_NOTIFY" ]; then
+          if [ $SYNC_STATUS -eq 0 ]; then
+            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed"
+          else
+            email_send "$SMTP_FROM_NAME - rclone backup failed" "$ERR"
+          fi
+        fi
+      fi
+      ;;
+
+  esac
+
+}
+
+
+##############################################################################################
+
+
+
+VALID="local email rclone"
+printf "Running backup to: %b\n" "$1" >> $LOG
+
+for METHOD in ${1//,/ }
+do
+  # check if provided backup method is valid
+  if echo $VALID | grep -q -w "$METHOD"; then 
+    if [ ! -n "$RESULT" ]; then
+      RESULT=$(make_backup)
     fi
+    backup $METHOD $RESULT
+  else
+    printf "Bad backup method provided: %b\n" "$METHOD" >> $LOG
   fi
-
-
-elif [ "$1" == "local" ]; then
-  printf "Running local backup\n" >> $LOG
-
-  RESULT=$(make_backup)
-
-  if [ -n "$BACKUP_EMAIL_NOTIFY" ]; then
-    email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
-  fi
-fi
+done

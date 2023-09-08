@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk --update --no-cache add sqlite mutt tzdata curl
+RUN apk --update --no-cache add sqlite mutt tzdata curl openssl
 RUN ln -sf /proc/1/fd/1 /var/log/backup.log
 
 # Install rclone

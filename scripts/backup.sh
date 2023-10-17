@@ -118,7 +118,7 @@ make_backup() {
   FILES=""
   FILES="$FILES $([ -d attachments ] && echo attachments)"
   FILES="$FILES $([ -d sends ] && echo sends)"
-  FILES="$FILES $([ -f config.json ] && echo sends)"
+  FILES="$FILES $([ -f config.json ] && echo config.json)"
   FILES="$FILES $([ -f rsa_key.der -o -f rsa_key.pem -o -f rsa_key.pub.der ] && echo rsa_key*)"
 
   # tar up files and encrypt with openssl and encryption key

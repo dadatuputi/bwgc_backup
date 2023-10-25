@@ -22,7 +22,7 @@ AUTH_METHOD=LOGIN
 
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "$1" == "email" -o -n "$BACKUP_EMAIL_NOTIFY" ] && [ ! -f "$MUTTRC" ]; then
+if [ "$1" == "email" -o "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ ! -f "$MUTTRC" ]; then
   if [ "$SMTP_SECURITY" == "force_tls" ]; then
     MUTT_SSL_KEY=ssl_force_tls
     SMTP_PROTO=smtps
@@ -113,24 +113,26 @@ make_backup() {
   sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"
 
   # build a string of files and directories to back up
-  DATA="/data"
-  cd $DATA
+  cd /
+  DATA="data"
   FILES=""
-  FILES="$FILES $([ -d attachments ] && echo attachments)"
-  FILES="$FILES $([ -d sends ] && echo sends)"
-  FILES="$FILES $([ -f config.json ] && echo config.json)"
-  FILES="$FILES $([ -f rsa_key.der -o -f rsa_key.pem -o -f rsa_key.pub.der ] && echo rsa_key*)"
+  FILES="$FILES $([ -d $DATA/attachments ] && echo $DATA/attachments)"
+  FILES="$FILES $([ -d $DATA/sends ] && echo $DATA/sends)"
+  FILES="$FILES $([ -r $DATA/config.json ] && echo $DATA/config.json)"
+  FILES="$FILES $([ -r $DATA/rsa_key.der -o -r $DATA/rsa_key.pem -o -r $DATA/rsa_key.pub.der ] && echo $DATA/rsa_key*)"
+
+  FILES="$FILES $([ -r .env ] && [ "$BACKUP_ENV" == "true" ] && echo .env)"
 
   # tar up files and encrypt with openssl and encryption key
-  BACKUP_DIR=$DATA/backups
+  BACKUP_DIR=/$DATA/backups
   BACKUP_FILE=$BACKUP_DIR/"bw_backup_$(date "+%F-%H%M%S").tar.gz"
 
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    tar -czf - -C $SQL_BACKUP_DIR $SQL_NAME -C $DATA $FILES | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE
+    tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE
   else
-    tar -czf $BACKUP_FILE -C $SQL_BACKUP_DIR $SQL_NAME -C $DATA $FILES
+    tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME
   fi
   printf "Backup file created at %b\n" "$BACKUP_FILE" >> $LOG
 
@@ -154,7 +156,7 @@ backup(){
   case $METHOD in
     local)
       printf "Running local backup\n" >> $LOG
-      if [ -n "$BACKUP_EMAIL_NOTIFY" ]; then
+      if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
         email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
       fi
 
@@ -188,7 +190,7 @@ backup(){
         fi
 
         # Send email if configured
-        if [ -n "$BACKUP_EMAIL_NOTIFY" ]; then
+        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
           if [ $SYNC_STATUS -eq 0 ]; then
             email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed"
           else

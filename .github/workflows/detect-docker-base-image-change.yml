@@ -26,8 +26,8 @@ jobs:
       - name: Get Image Names
         id: images
         run: |
-          echo "IMAGE_BASE=docker://$(grep "^FROM" Dockerfile | head -n 1 | sed 's/^FROM\s\+//')" | tee -a $GITHUB_ENV
-          echo "IMAGE_DERIVED=docker://ghcr.io/${GITHUB_REPOSITORY}:master" | tee -a $GITHUB_ENV
+          echo "IMAGE_BASE=$(grep "^FROM" Dockerfile | head -n 1 | sed 's/^FROM\s\+//')" | tee -a $GITHUB_ENV
+          echo "IMAGE_DERIVED=ghcr.io/${GITHUB_REPOSITORY}:master" | tee -a $GITHUB_ENV
 
       - name: Check if update available
         id: check

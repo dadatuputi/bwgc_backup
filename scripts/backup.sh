@@ -182,20 +182,29 @@ backup(){
       # Only run if $BACKUP_RCLONE_CONF has been setup
       if [ -s "$BACKUP_RCLONE_CONF" ]; then
         # Sync with rclone
-        REMOTE=$(rclone --config $BACKUP_RCLONE_CONF listremotes | head -n 1)
-        ERR=$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)
-        SYNC_STATUS=$?
+        REMOTES=$(rclone --config $BACKUP_RCLONE_CONF listremotes | tr '\n' ' ')
+        SYNC_TOTAL_CNT=0
+        SYNC_FAILED_CNT=0
+        for REMOTE in $REMOTES
+        do
+          SYNC_TOTAL_CNT=$(($SYNC_TOTAL_CNT + 1))
+          SYNC_LOG_ITEM="$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)"
+          if [ $? -ne 0 ]; then
+            SYNC_ERROR_LOG="${SYNC_LOG}Sync log with ${REMOTE}\n==========\n${SYNC_LOG_ITEM}\n==========\n\n"
+            SYNC_FAILED_CNT=$(($SYNC_FAILED_CNT + 1))
+          fi
+        done
 
-        if [ $SYNC_STATUS -ne 0 ]; then
-          printf "Failed to sync:\n  %b\n" "$ERR" >> $LOG
+        if [ $SYNC_FAILED_CNT -ne 0 ]; then
+          printf "Failed to sync to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b\n" "$SYNC_ERROR_LOG" >> $LOG
         fi
 
         # Send email if configured
         if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-          if [ $SYNC_STATUS -eq 0 ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed"
+          if [ $SYNC_FAILED_CNT -eq 0 ]; then
+            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed to ${SYNC_TOTAL_CNT} remotes"
           else
-            email_send "$SMTP_FROM_NAME - rclone backup failed" "$ERR"
+            email_send "$SMTP_FROM_NAME - rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes" "$SYNC_ERROR_LOG"
           fi
         fi
       fi

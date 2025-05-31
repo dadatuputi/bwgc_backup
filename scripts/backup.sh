@@ -190,7 +190,7 @@ backup(){
           SYNC_TOTAL_CNT=$(($SYNC_TOTAL_CNT + 1))
           SYNC_LOG_ITEM="$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)"
           if [ $? -ne 0 ]; then
-            SYNC_ERROR_LOG="${SYNC_LOG}Sync log with ${REMOTE}\n==========\n${SYNC_LOG_ITEM}\n==========\n\n"
+            SYNC_ERROR_LOG="${SYNC_ERROR_LOG}Sync log with ${REMOTE}\n==========\n${SYNC_LOG_ITEM}\n==========\n\n"
             SYNC_FAILED_CNT=$(($SYNC_FAILED_CNT + 1))
           fi
         done

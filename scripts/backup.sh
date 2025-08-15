@@ -19,6 +19,7 @@ AUTH_METHOD=LOGIN
 # Backup settings - provided as environment variables but may be set below:
 # SMTP_FROM_NAME=
 # BACKUP_EMAIL_TO=
+# BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY=
 
 ###### E-mail Functions ######################################################################
 
@@ -111,7 +112,10 @@ make_backup() {
   SQL_NAME="db.sqlite3"
   SQL_BACKUP_DIR="/tmp"
   SQL_BACKUP_NAME=$SQL_BACKUP_DIR/$SQL_NAME
-  sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"
+  if ! sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"; then
+    printf "Error: Failed to backup SQLite database\n" >> $LOG
+    return 1
+  fi
 
   # build a string of files and directories to back up
   cd /
@@ -131,9 +135,17 @@ make_backup() {
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE
+    if ! tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
+      printf "Error: Failed to create encrypted backup\n" >> $LOG
+      rm -f $SQL_BACKUP_NAME
+      return 1
+    fi
   else
-    tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME
+    if ! tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME; then
+      printf "Error: Failed to create backup\n" >> $LOG
+      rm -f $SQL_BACKUP_NAME
+      return 1
+    fi
   fi
   printf "Backup file created at %b\n" "$BACKUP_FILE" >> $LOG
 
@@ -144,6 +156,7 @@ make_backup() {
   find $BACKUP_DIR/* -mtime +$BACKUP_DAYS -exec rm {} \;
 
   printf "$BACKUP_FILE"
+  return 0
 }
 
 
@@ -151,31 +164,47 @@ make_backup() {
 # Main Backup 
 
 backup(){
-  
   METHOD=$1
   RESULT=$2
+  EXIT_CODE=$3
+
+  # If the backup generation failed (exit code != 0), handle failure notification immediately
+  if [ "$EXIT_CODE" -ne 0 ]; then
+    printf "%s backup skipped because archive creation failed.\n" "$METHOD" >> $LOG
+    
+    if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+       email_send "$SMTP_FROM_NAME - Backup Failed" "The backup creation process failed. Please check the logs at $LOG."
+    fi
+    return 1
+  fi
+
+  # If we are here, backup creation was successful ($EXIT_CODE is 0)
   case $METHOD in
     local)
       printf "Running local backup\n" >> $LOG
-      if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+      if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
         email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
       fi
-
       ;;
+
     email)
       # Handle E-mail Backup
       printf "Running email backup\n" >> $LOG
       # Backup and send e-mail
-      FILENAME=$(basename $RESULT)
-      BODY=$(email_body $FILENAME)
-      email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
+      if [ -n "$RESULT" ]; then
+        FILENAME=$(basename $RESULT)
+        BODY=$(email_body $FILENAME)
+        email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
+      else
+        printf "Error: No result file to email.\n" >> $LOG
+      fi
       ;;
 
     rclone)
       # Handle rclone Backup
       printf "Running rclone backup\n" >> $LOG
       # Initialize rclone if BACKUP=rclone and $(which rclone) is blank
-      if [ "$1" == "rclone" -a -z "$(which rclone)" ]; then
+      if [ "$METHOD" == "rclone" -a -z "$(which rclone)" ]; then
         rclone_init
       fi
 
@@ -185,6 +214,7 @@ backup(){
         REMOTES=$(rclone --config $BACKUP_RCLONE_CONF listremotes | tr '\n' ' ')
         SYNC_TOTAL_CNT=0
         SYNC_FAILED_CNT=0
+        
         for REMOTE in $REMOTES
         do
           SYNC_TOTAL_CNT=$(($SYNC_TOTAL_CNT + 1))
@@ -197,21 +227,25 @@ backup(){
 
         if [ $SYNC_FAILED_CNT -ne 0 ]; then
           printf "Failed to sync to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b\n" "$SYNC_ERROR_LOG" >> $LOG
-        fi
-
-        # Send email if configured
-        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-          if [ $SYNC_FAILED_CNT -eq 0 ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed to ${SYNC_TOTAL_CNT} remotes"
-          else
-            email_send "$SMTP_FROM_NAME - rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes" "$SYNC_ERROR_LOG"
+          # Send failure email
+          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+            email_send "$SMTP_FROM_NAME - rclone backup failed" "Rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes.\n\nErrors:\n$SYNC_ERROR_LOG"
           fi
+        else
+          # Success
+          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
+            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed successfully to ${SYNC_TOTAL_CNT} remotes."
+          fi
+        fi
+      else
+        printf "Rclone backup skipped - BACKUP_RCLONE_CONF not found or empty\n" >> $LOG
+        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+            email_send "$SMTP_FROM_NAME - rclone config error" "Rclone backup failed: Configuration file not found at $BACKUP_RCLONE_CONF."
         fi
       fi
       ;;
 
   esac
-
 }
 
 ###### Restore ###############################################################################
@@ -299,7 +333,9 @@ restore_backup() {
   
   # Create backup using existing local backup function
   printf "Creating backup of current state before restoration...\n" >> $LOG
-  make_backup
+  if ! make_backup > /dev/null; then
+    printf "Warning: Safety backup failed! Proceeding anyway...\n" >> $LOG
+  fi
   
   # Stop the bitwarden container before restoration
   BITWARDEN_STOPPED=0
@@ -446,11 +482,21 @@ case "$1" in
       # check if provided backup method is valid
       if echo $VALID | grep -q -w "$METHOD"; then 
         if [ ! -n "$RESULT" ]; then
+          # Capture result (filename) AND the exit code separately
           RESULT=$(make_backup)
+          BACKUP_EXIT_CODE=$?
         fi
-        backup $METHOD $RESULT
-        printf "Completd backup to: %b\n" "$METHOD" >> $LOG
-        printf "Completd backup to: %b\n" "$METHOD" >&2
+        
+        # We pass the exit code to backup function
+        backup "$METHOD" "$RESULT" "$BACKUP_EXIT_CODE"
+        
+        if [ $BACKUP_EXIT_CODE -eq 0 ]; then
+            printf "Completed backup to: %b\n" "$METHOD" >> $LOG
+            printf "Completed backup to: %b\n" "$METHOD" >&2
+        else
+            printf "Backup failed for method: %b\n" "$METHOD" >> $LOG
+            printf "Backup failed for method: %b\n" "$METHOD" >&2
+        fi
       else
         COMMAND_ERROR=1
         printf "Bad backup method provided: %b\n" "$METHOD" >> $LOG

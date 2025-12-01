@@ -19,6 +19,7 @@ AUTH_METHOD=LOGIN
 # Backup settings - provided as environment variables but may be set below:
 # SMTP_FROM_NAME=
 # BACKUP_EMAIL_TO=
+# BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY=
 
 ###### E-mail Functions ######################################################################
 
@@ -111,7 +112,10 @@ make_backup() {
   SQL_NAME="db.sqlite3"
   SQL_BACKUP_DIR="/tmp"
   SQL_BACKUP_NAME=$SQL_BACKUP_DIR/$SQL_NAME
-  sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"
+  if ! sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"; then
+    printf "Error: Failed to backup SQLite database\n" >> $LOG
+    return 1
+  fi
 
   # build a string of files and directories to back up
   cd /
@@ -131,9 +135,17 @@ make_backup() {
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE
+    if ! tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
+      printf "Error: Failed to create encrypted backup\n" >> $LOG
+      rm -f $SQL_BACKUP_NAME
+      return 1
+    fi
   else
-    tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME
+    if ! tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME; then
+      printf "Error: Failed to create backup\n" >> $LOG
+      rm -f $SQL_BACKUP_NAME
+      return 1
+    fi
   fi
   printf "Backup file created at %b\n" "$BACKUP_FILE" >> $LOG
 
@@ -144,6 +156,7 @@ make_backup() {
   find $BACKUP_DIR/* -mtime +$BACKUP_DAYS -exec rm {} \;
 
   printf "$BACKUP_FILE"
+  return 0
 }
 
 
@@ -154,57 +167,95 @@ backup(){
   
   METHOD=$1
   RESULT=$2
+  BACKUP_SUCCESS=$3  # New parameter to indicate backup success/failure
   case $METHOD in
     local)
       printf "Running local backup\n" >> $LOG
-      if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-        email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
+      # Check if backup was successful
+      if [ "$BACKUP_SUCCESS" = "0" ]; then
+        # Backup successful
+        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
+          email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed successfully"
+        fi
+      else
+        # Backup failed
+        printf "Local backup failed\n" >> $LOG
+        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+          email_send "$SMTP_FROM_NAME - local backup FAILED" "Local backup failed. Please check the logs for more details."
+        fi
       fi
 
       ;;
     email)
       # Handle E-mail Backup
       printf "Running email backup\n" >> $LOG
-      # Backup and send e-mail
-      FILENAME=$(basename $RESULT)
-      BODY=$(email_body $FILENAME)
-      email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
+      # Check if backup was successful before sending email
+      if [ "$BACKUP_SUCCESS" = "0" ] && [ -n "$RESULT" ]; then
+        # Backup and send e-mail
+        FILENAME=$(basename $RESULT)
+        BODY=$(email_body $FILENAME)
+        email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
+      else
+        # Backup failed, send error notification
+        printf "Email backup failed - no backup file to send\n" >> $LOG
+        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+          email_send "$SMTP_FROM_NAME - backup FAILED" "Backup creation failed. Please check the logs for more details."
+        fi
+      fi
       ;;
 
     rclone)
       # Handle rclone Backup
       printf "Running rclone backup\n" >> $LOG
-      # Initialize rclone if BACKUP=rclone and $(which rclone) is blank
-      if [ "$1" == "rclone" -a -z "$(which rclone)" ]; then
-        rclone_init
-      fi
-
-      # Only run if $BACKUP_RCLONE_CONF has been setup
-      if [ -s "$BACKUP_RCLONE_CONF" ]; then
-        # Sync with rclone
-        REMOTES=$(rclone --config $BACKUP_RCLONE_CONF listremotes | tr '\n' ' ')
-        SYNC_TOTAL_CNT=0
-        SYNC_FAILED_CNT=0
-        for REMOTE in $REMOTES
-        do
-          SYNC_TOTAL_CNT=$(($SYNC_TOTAL_CNT + 1))
-          SYNC_LOG_ITEM="$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)"
-          if [ $? -ne 0 ]; then
-            SYNC_ERROR_LOG="${SYNC_ERROR_LOG}Sync log with ${REMOTE}\n==========\n${SYNC_LOG_ITEM}\n==========\n\n"
-            SYNC_FAILED_CNT=$(($SYNC_FAILED_CNT + 1))
-          fi
-        done
-
-        if [ $SYNC_FAILED_CNT -ne 0 ]; then
-          printf "Failed to sync to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b\n" "$SYNC_ERROR_LOG" >> $LOG
+      
+      # Check if initial backup creation was successful
+      if [ "$BACKUP_SUCCESS" != "0" ]; then
+        printf "Rclone backup skipped - initial backup creation failed\n" >> $LOG
+        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+          email_send "$SMTP_FROM_NAME - rclone backup FAILED" "Rclone backup failed - initial backup creation failed. Please check the logs for more details."
+        fi
+      else
+        # Initialize rclone if BACKUP=rclone and $(which rclone) is blank
+        if [ "$METHOD" == "rclone" -a -z "$(which rclone)" ]; then
+          rclone_init
         fi
 
-        # Send email if configured
-        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-          if [ $SYNC_FAILED_CNT -eq 0 ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed to ${SYNC_TOTAL_CNT} remotes"
-          else
-            email_send "$SMTP_FROM_NAME - rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes" "$SYNC_ERROR_LOG"
+        # Only run if $BACKUP_RCLONE_CONF has been setup
+        if [ -s "$BACKUP_RCLONE_CONF" ]; then
+          # Sync with rclone
+          REMOTES=$(rclone --config $BACKUP_RCLONE_CONF listremotes | tr '\n' ' ')
+          SYNC_TOTAL_CNT=0
+          SYNC_FAILED_CNT=0
+          for REMOTE in $REMOTES
+          do
+            SYNC_TOTAL_CNT=$(($SYNC_TOTAL_CNT + 1))
+            SYNC_LOG_ITEM="$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)"
+            if [ $? -ne 0 ]; then
+              SYNC_ERROR_LOG="${SYNC_ERROR_LOG}Sync log with ${REMOTE}\n==========\n${SYNC_LOG_ITEM}\n==========\n\n"
+              SYNC_FAILED_CNT=$(($SYNC_FAILED_CNT + 1))
+            fi
+          done
+
+          if [ $SYNC_FAILED_CNT -ne 0 ]; then
+            printf "Failed to sync to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b\n" "$SYNC_ERROR_LOG" >> $LOG
+          fi
+
+          # Send email if configured
+          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+            if [ $SYNC_FAILED_CNT -eq 0 ]; then
+              # Success case - only send if not failure-only mode
+              if [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
+                email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed to ${SYNC_TOTAL_CNT} remotes"
+              fi
+            else
+              # Failure case - always send
+              email_send "$SMTP_FROM_NAME - rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes" "$SYNC_ERROR_LOG"
+            fi
+          fi
+        else
+          printf "Rclone backup skipped - BACKUP_RCLONE_CONF not configured\n" >> $LOG
+          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
+            email_send "$SMTP_FROM_NAME - rclone backup FAILED" "Rclone backup failed - BACKUP_RCLONE_CONF not configured."
           fi
         fi
       fi
@@ -438,14 +489,23 @@ case "$1" in
     VALID="local email rclone"
     printf "Running backup to: %b\n" "$1" >> $LOG
     
+    # Initialize backup success flag
+    BACKUP_SUCCESS=0
+    
     for METHOD in ${1//,/ }
     do
       # check if provided backup method is valid
       if echo $VALID | grep -q -w "$METHOD"; then 
         if [ ! -n "$RESULT" ]; then
           RESULT=$(make_backup)
+          BACKUP_SUCCESS=$?
+          if [ $BACKUP_SUCCESS -ne 0 ]; then
+            printf "Backup creation failed with exit code %d\n" "$BACKUP_SUCCESS" >> $LOG
+            # Set RESULT to empty to indicate failure for email method
+            RESULT=""
+          fi
         fi
-        backup $METHOD $RESULT
+        backup $METHOD $RESULT $BACKUP_SUCCESS
       else
         printf "Bad backup method provided: %b\n" "$METHOD" >> $LOG
       fi

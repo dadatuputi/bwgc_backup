@@ -420,10 +420,12 @@ restore_backup() {
   fi
   
   printf "Restore completed.\n" >> $LOG
-  printf "Restore completed successfully.\n"
+  printf "Restore completed.\n"
 }
 
 ###### Main Execution ########################################################################
+
+COMMAND_ERROR=0
 
 case "$1" in
   restore)
@@ -434,9 +436,10 @@ case "$1" in
     fi
     restore_backup "$2"
     ;;
-  local|email|rclone)
+  local|email|rclone|*)
     VALID="local email rclone"
-    printf "Running backup to: %b\n" "$1" >> $LOG
+    printf "Performing backup to: %b\n" "$1" >> $LOG
+    printf "Performing backup to: %b\n" "$1"
     
     for METHOD in ${1//,/ }
     do
@@ -446,13 +449,17 @@ case "$1" in
           RESULT=$(make_backup)
         fi
         backup $METHOD $RESULT
+        printf "Completd backup to: %b\n" "$METHOD" >> $LOG
+        printf "Completd backup to: %b\n" "$METHOD" >&2
       else
+        COMMAND_ERROR=1
         printf "Bad backup method provided: %b\n" "$METHOD" >> $LOG
+        printf "Bad backup method provided: %b\n" "$METHOD" >&2
       fi
     done
-    ;;
-  *)
-    printf "Usage: $0 {local|email|rclone|restore <backup_file>}\n" >&2
-    exit 1
+
+    if [ "$COMMAND_ERROR" = 1 ]; then
+      printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n" >&2
+    fi
     ;;
 esac

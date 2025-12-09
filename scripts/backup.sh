@@ -21,6 +21,49 @@ AUTH_METHOD=LOGIN
 # BACKUP_EMAIL_TO=
 # BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY=
 
+###### Utility Functions #####################################################################
+
+# log
+# Args:
+#   $1 - MESSAGE: The log message text (string)
+#   $2 - LEVEL: Optional log level (INFO|WARNING|ERROR). Defaults to INFO.
+# Behavior:
+#   Writes the message to stdout (INFO) or stderr (WARNING/ERROR) and
+#   appends the same message to the file at $LOG.
+# Returns:
+#   Always returns 0 (used for side-effect logging).
+log() {
+  MESSAGE=$1
+  LEVEL=${2:-INFO}
+
+  # Build a single-line message and explicitly add newlines when printing
+  MSG_PREFIX=$(printf "%s: %s" "$LEVEL" "$MESSAGE")
+
+  case "$LEVEL" in
+    ERROR|WARNING)
+      # Errors and warnings should be visible on stderr
+      printf '%s\n' "$MSG_PREFIX" >&2
+      ;;
+    *)
+      # Informational messages go to stdout
+      printf '%s\n' "$MSG_PREFIX"
+      ;;
+  esac
+
+  printf '%s\n' "$MSG_PREFIX" >> "$LOG"
+}
+
+# log_error
+# Args:
+#   $1 - MESSAGE: The error message text.
+# Behavior:
+#   Convenience wrapper around log() that emits an ERROR-level message.
+# Returns:
+#   Same as log() (0) after emitting the message.
+log_error() {
+  log "$1" "ERROR"
+}
+
 ###### E-mail Functions ######################################################################
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
@@ -462,50 +505,81 @@ restore_backup() {
 ###### Main Execution ########################################################################
 
 COMMAND_ERROR=0
+USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n")
+VALID="local email rclone"
 
 case "$1" in
   restore)
     if [ -z "$2" ]; then
-      printf "Error: No backup file specified.\n" >&2
-      printf "Usage: $0 restore <backup_file>\n" >&2
+      log_error "No backup file specified."
+      printf '%b\n' "$USAGE" >&2
       exit 1
     fi
     restore_backup "$2"
     ;;
-  local|email|rclone|*)
-    VALID="local email rclone"
-    printf "Performing backup to: %b\n" "$1" >> $LOG
-    printf "Performing backup to: %b\n" "$1"
+  *)
+    # Check for extraneous arguments
+    if [ -n "$2" ]; then
+      log_error "Error: Unexpected argument '$2'. Only one backup method argument is allowed."
+      printf '%b\n' "$USAGE" >&2
+      exit 1
+    fi
     
-    for METHOD in ${1//,/ }
-    do
-      # check if provided backup method is valid
-      if echo $VALID | grep -q -w "$METHOD"; then 
-        if [ ! -n "$RESULT" ]; then
-          # Capture result (filename) AND the exit code separately
-          RESULT=$(make_backup)
-          BACKUP_EXIT_CODE=$?
+    # validate backup methods - fail fast
+    METHODS=$(printf "%s" "$1" | tr ',' ' ')
+    for METHOD in $METHODS; do
+      if ! echo $VALID | grep -q -w "$METHOD"; then
+        ERROR=$(printf "Invalid backup method '%s'; backup failed\n" "$METHOD")
+        log_error "$ERROR"
+        printf '%b\n' "$USAGE" >&2
+        if [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+          email_send "$SMTP_FROM_NAME - Backup Failed" "$ERROR"
         fi
-        
-        # We pass the exit code to backup function
-        backup "$METHOD" "$RESULT" "$BACKUP_EXIT_CODE"
-        
-        if [ $BACKUP_EXIT_CODE -eq 0 ]; then
-            printf "Completed backup to: %b\n" "$METHOD" >> $LOG
-            printf "Completed backup to: %b\n" "$METHOD" >&2
-        else
-            printf "Backup failed for method: %b\n" "$METHOD" >> $LOG
-            printf "Backup failed for method: %b\n" "$METHOD" >&2
-        fi
-      else
-        COMMAND_ERROR=1
-        printf "Bad backup method provided: %b\n" "$METHOD" >> $LOG
-        printf "Bad backup method provided: %b\n" "$METHOD" >&2
+        exit 1
       fi
     done
 
-    if [ "$COMMAND_ERROR" = 1 ]; then
-      printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n" >&2
+    # create backup file
+    # capture result (filename) AND the exit code separately
+    # send notification & exit if backup failed
+    RESULT=$(make_backup)
+    BACKUP_EXIT_CODE=$?
+    if [ $BACKUP_EXIT_CODE -eq 0 ]; then
+      log "$(printf "Created backup at: %s" "$RESULT")"
+    else
+      ERROR="Backup creation failed. Check the logs for additional details."
+      log_error "$ERROR"
+      if [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+        email_send "$SMTP_FROM_NAME - Backup Failed" "$ERROR"
+      fi
+      exit 1
+    fi
+    
+    SUCCESSFUL_BACKUPS=""
+    for METHOD in $METHODS; do
+      log "$(printf "Performing '%s' backup..." "$METHOD")"
+
+      # We pass the exit code to backup function
+      if ERROR=$(backup "$METHOD" "$RESULT"); then
+        SUCCESSFUL_BACKUPS="$SUCCESSFUL_BACKUPS $METHOD"
+        log "$(printf "Backup to %b completed" "$METHOD")"
+      else
+        ERROR="$(printf "Backup via %b failed: %b" "$METHOD" "$ERROR")"
+        log_error "$ERROR"
+        if [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+          email_send "$SMTP_FROM_NAME - $METHOD Backup Failed" "$ERROR"
+        fi
+      fi
+    done
+
+    if [ -n "$SUCCESSFUL_BACKUPS" ]; then
+      if [ "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
+        BODY="Backup completed successfully via: $SUCCESSFUL_BACKUPS"
+        email_send "$SMTP_FROM_NAME - Backup Successful" "$BODY" "$RESULT"
+      fi
+    else
+      log_error "All backup methods failed."
+      exit 1
     fi
     ;;
 esac

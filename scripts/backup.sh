@@ -83,10 +83,16 @@ EOF
   printf "Finished configuring email.\n" >$LOG
 fi
 
-# Send an email
-# $1: subject
-# $2: body
-# $3: attachment
+# email_send
+# Args:
+#   $1 - SUBJECT: Subject line for the email
+#   $2 - BODY: Email body text (can contain newlines and escapes)
+#   $3 - ATTACHMENT: Optional path to an attachment file
+# Behavior:
+#   Sends an email using `mutt` configured via $MUTTRC. On success logs a sent message;
+#   on failure logs an ERROR with the mutt output.
+# Returns:
+#   0 on success (mutt exit 0); non-zero on failure (mutt non-zero).
 email_send() {
   if [ -n "$3" ]; then
     ATTACHMENT="-a $3 --"
@@ -102,9 +108,14 @@ email_send() {
 }
 
 
-# Build email body message
-# Print instructions to untar and unencrypt as needed
-# $1: backup filename
+
+# email_body
+# Args:
+#   $1 - FILENAME: The backup filename (used to compute instructions for tar/openssl)
+# Behavior:
+#   Prints an email-friendly body describing how to restore/decrypt the provided backup.
+# Returns:
+#   Writes the generated body to stdout.
 email_body() {
   EXT=${1##*.}
   FILE=${1%%.*}
@@ -127,8 +138,16 @@ To restore, untar in the Bitwarden data directory:
 
 ###### Backup Functions ######################################################################
 
-# Initialize rclone
+
 RCLONE=/usr/bin/rclone
+# rclone_init
+# Args:
+#   None
+# Behavior:
+#   Installs `rclone` into $RCLONE (used only if rclone missing). Typically a no-op
+#   because the Dockerfile installs rclone. Logs installation progress.
+# Returns:
+#   0 on success; non-zero on failure during installation.
 rclone_init() {
   # Install rclone - https://wiki.alpinelinux.org/wiki/Rclone
   # rclone install now handled in Dockerfile, so this function should never be executed
@@ -142,7 +161,7 @@ rclone_init() {
   printf "Rclone installed to %b\n" "$RCLONE" >> $LOG
 }
 
-
+# make_backup
 # Create backup and prune old backups
 # Borrowed heavily from https://github.com/shivpatel/bitwarden_rs-local-backup
 # with the addition of backing up:
@@ -150,6 +169,14 @@ rclone_init() {
 # * sends directory
 # * config.json
 # * rsa_key* files
+# Args:
+#   None
+# Behavior:
+#   Creates a compressed tarball of vaultwarden data (attachments, sends, config, rsa_key*, .env if enabled)
+#   and a temporary sqlite3 backup. If BACKUP_ENCRYPTION_KEY is set the tarball is encrypted with openssl.
+#   The created backup filename is printed to stdout on success.
+# Returns:
+#   0 on success (filename printed to stdout), non-zero on failure. Side-effects: writes file to $BACKUP_DIR.
 make_backup() {
   # use sqlite3 to create backup (avoids corruption if db write in progress)
   SQL_NAME="db.sqlite3"
@@ -206,22 +233,18 @@ make_backup() {
 ##############################################################################################
 # Main Backup 
 
+# backup
+# Args:
+#   $1 - METHOD: Backup method name (local, email, rclone)
+#   $2 - RESULT: Path to the backup file produced by make_backup()
+# Behavior:
+#   Performs method-specific actions (no-op for local, emails the file for email, rclones the file for rclone).
+# Returns:
+#   0 on success, non-zero on failure.
 backup(){
   METHOD=$1
   RESULT=$2
-  EXIT_CODE=$3
 
-  # If the backup generation failed (exit code != 0), handle failure notification immediately
-  if [ "$EXIT_CODE" -ne 0 ]; then
-    printf "%s backup skipped because archive creation failed.\n" "$METHOD" >> $LOG
-    
-    if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-       email_send "$SMTP_FROM_NAME - Backup Failed" "The backup creation process failed. Please check the logs at $LOG."
-    fi
-    return 1
-  fi
-
-  # If we are here, backup creation was successful ($EXIT_CODE is 0)
   case $METHOD in
     local)
       printf "Running local backup\n" >> $LOG
@@ -293,7 +316,13 @@ backup(){
 
 ###### Restore ###############################################################################
 
-# Function to stop the bitwarden container
+# stop_bitwarden
+# Args:
+#   None
+# Behavior:
+#   Attempts to stop the `bitwarden` Docker container using `docker stop`.
+# Returns:
+#   0 on success; non-zero if container could not be stopped.
 stop_bitwarden() {
   printf "Stopping vaultwarden container...\n" >> $LOG
   if ! docker stop bitwarden > /dev/null; then
@@ -303,7 +332,13 @@ stop_bitwarden() {
   return 0
 }
 
-# Function to start the bitwarden container
+# start_bitwarden
+# Args:
+#   None
+# Behavior:
+#   Attempts to start the `bitwarden` Docker container using `docker start`.
+# Returns:
+#   0 on success; non-zero if the container failed to start.
 start_bitwarden() {
   printf "Starting vaultwarden container...\n" >> $LOG
   if ! docker start bitwarden > /dev/null; then
@@ -313,8 +348,15 @@ start_bitwarden() {
   return 0
 }
 
-# Restore a backup file
-# $1: path to backup file
+# restore_backup
+# Args:
+#   $1 - BACKUP_FILE: Path to the backup archive to restore (may be encrypted with .aes256)
+# Behavior:
+#   Creates an emergency backup of current data, decrypts (if necessary) and extracts the provided
+#   backup into a temporary directory, stops the running container, restores DB and data files,
+#   and restarts the container if it was stopped. Writes progress and errors to the log.
+# Returns:
+#   Exits with non-zero on fatal errors; returns 0 on successful completion.
 restore_backup() {
   BACKUP_FILE=$1
   

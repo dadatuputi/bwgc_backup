@@ -82,7 +82,7 @@ set ${MUTT_SSL_KEY}=yes
 set smtp_url="${SMTP_PROTO}://${SMTP_USERNAME}@${SMTP_HOST}:${SMTP_PORT}"
 set smtp_pass="${SMTP_PASSWORD}"
 EOF
-  printf "Finished configuring email.\n" >$LOG
+  log "Finished configuring email."
 fi
 
 # email_send
@@ -224,15 +224,21 @@ make_backup() {
       return 1
     fi
   fi
-  printf "Backup file created at %b\n" "$BACKUP_FILE" >> $LOG
 
   # cleanup tmp folder
   rm -f $SQL_BACKUP_NAME
 
-  # rm any backups older than 30 days
-  find $BACKUP_DIR/* -mtime +$BACKUP_DAYS -exec rm {} \;
+  # rm any backups older than BACKUP_DAYS (only if BACKUP_DAYS is a positive integer)
+  case "$BACKUP_DAYS" in
+    ''|*[!0-9]*)
+      log "BACKUP_DAYS is not set or not a positive integer; skipping old-backup pruning" "WARNING"
+      ;;
+    *)
+      find "$BACKUP_DIR" -type f -mtime +"$BACKUP_DAYS" -exec rm -f {} \;
+      ;;
+  esac
 
-  printf "$BACKUP_FILE"
+  printf '%s' "$BACKUP_FILE"
   return 0
 }
 
@@ -254,28 +260,21 @@ backup(){
 
   case $METHOD in
     local)
-      printf "Running local backup\n" >> $LOG
-      if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
-        email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
-      fi
+      # Nothing additional to do for local backup
       ;;
 
     email)
-      # Handle E-mail Backup
-      printf "Running email backup\n" >> $LOG
-      # Backup and send e-mail
       if [ -n "$RESULT" ]; then
         FILENAME=$(basename $RESULT)
         BODY=$(email_body $FILENAME)
         email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
       else
-        printf "Error: No result file to email.\n" >> $LOG
+        printf "No result file to email"
+        return 1
       fi
       ;;
 
     rclone)
-      # Handle rclone Backup
-      printf "Running rclone backup\n" >> $LOG
       # Initialize rclone if BACKUP=rclone and $(command -v rclone) is blank
       if [ "$METHOD" = "rclone" -a -z "$(command -v rclone)" ]; then
         rclone_init
@@ -299,26 +298,17 @@ backup(){
         done
 
         if [ $SYNC_FAILED_CNT -ne 0 ]; then
-          printf "Failed to sync to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b\n" "$SYNC_ERROR_LOG" >> $LOG
-          # Send failure email
-          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup failed" "Rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes.\n\nErrors:\n$SYNC_ERROR_LOG"
-          fi
-        else
-          # Success
-          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed successfully to ${SYNC_TOTAL_CNT} remotes."
-          fi
+          printf "Failed to sync on ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b" "$SYNC_ERROR_LOG"
+          return 1
         fi
       else
-        printf "Rclone backup skipped - BACKUP_RCLONE_CONF not found or empty\n" >> $LOG
-        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-            email_send "$SMTP_FROM_NAME - rclone config error" "Rclone backup failed: Configuration file not found at $BACKUP_RCLONE_CONF."
-        fi
+        printf "Configuration file not found at $BACKUP_RCLONE_CONF"
+        return 1
       fi
       ;;
-
   esac
+
+  return 0
 }
 
 ###### Restore ###############################################################################

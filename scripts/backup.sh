@@ -6,6 +6,8 @@
 
 LOG=/var/log/backup.log
 MUTTRC=/tmp/muttrc
+DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
+export DOCKER_API_VERSION
 
 # Bitwarden Email settings - usually provided as environment variables for but may be set below:
 # SMTP_HOST=
@@ -373,6 +375,14 @@ restore_backup() {
   # Create backup using existing local backup function
   log "Creating backup of current state before restoration..."
 
+  EMERGENCY_BACKUP=$(make_backup)
+  BACKUP_EXIT_CODE=$?
+
+  if [ $BACKUP_EXIT_CODE -ne 0 ]; then
+    log_error "Safety backup failed! Exiting."
+    exit $BACKUP_EXIT_CODE
+  fi
+
   log "$(printf "Attempting to restore from %s" "$BACKUP_FILE")"
   
   # Create a temporary directory for extraction
@@ -425,11 +435,6 @@ restore_backup() {
     fi
   fi
   
-  # Create backup using existing local backup function
-  printf "Creating backup of current state before restoration...\n" >> $LOG
-  if ! make_backup > /dev/null; then
-    printf "Warning: Safety backup failed! Proceeding anyway...\n" >> $LOG
-  fi
   
   # Stop the bitwarden container before restoration
   BITWARDEN_STOPPED=0
@@ -515,7 +520,9 @@ restore_backup() {
   # Restore .env file if it was backed up
   if [ -f "$RESTORE_TMP_DIR/.env" ] && [ "$BACKUP_ENV" = "true" ]; then
     # Copy to a location that's accessible but won't cause conflicts
-    cp "$RESTORE_TMP_DIR/.env" "/data/.env.restored" || printf "Failed to copy .env to reference location.\n" >> $LOG
+    FILENAME=".env.restored"
+    REF_LOCATION=$(printf "/data/%b" "$FILENAME")
+    cp "$RESTORE_TMP_DIR/.env" "$REF_LOCATION" || log "$(printf "Failed to copy .env to %s" "$REF_LOCATION")" "WARNING"
     
     # Print detailed instructions for the user
     INSTRUCTIONS="
@@ -525,16 +532,16 @@ restore_backup() {
     
     The .env file cannot be automatically restored while Docker Compose is running.
     A copy of the restored .env file has been placed at:
-      bitwarden/.env.restored
+      bitwarden/$FILENAME
     
     To complete the restoration process manually:
     
     1. Review the differences between your current .env and the restored version:
-       diff .env bitwarden/.env.restored
+       diff .env bitwarden/$FILENAME
     
     2. To fully apply the restored .env:
        a. Stop all services: docker-compose down
-       b. Replace your .env file: cp bitwarden/.env.restored .env
+       b. Replace your .env file: cp bitwarden/$FILENAME .env
        c. Restart services: docker-compose up -d
     
     NOTE: Only do this if you want to completely replace your current environment settings!

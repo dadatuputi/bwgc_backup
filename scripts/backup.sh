@@ -67,8 +67,8 @@ log_error() {
 ###### E-mail Functions ######################################################################
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "$1" == "email" -o "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ ! -f "$MUTTRC" ]; then
-  if [ "$SMTP_SECURITY" == "force_tls" ]; then
+if [ "$1" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
+  if [ "$SMTP_SECURITY" = "force_tls" ]; then
     MUTT_SSL_KEY=ssl_force_tls
     SMTP_PROTO=smtps
   else
@@ -94,16 +94,20 @@ fi
 # Returns:
 #   0 on success (mutt exit 0); non-zero on failure (mutt non-zero).
 email_send() {
-  if [ -n "$3" ]; then
-    ATTACHMENT="-a $3 --"
+  SUBJECT=$1
+  BODY=$2
+  ATTACHMENT=$3
+
+  if [ -n "$ATTACHMENT" ]; then
+    ATTACHMENT="-a $ATTACHMENT --"
   else 
     ATTACHMENT=""
   fi
 
-  if EMAIL_RESULT=$(printf "$2" | EMAIL="$SMTP_FROM_NAME <$SMTP_FROM>" mutt -F "$MUTTRC" -s "$1" $ATTACHMENT "$BACKUP_EMAIL_TO" 2>&1); then
-    printf "Sent e-mail (%b) to %b\n" "$1" "$BACKUP_EMAIL_TO" >> $LOG
+  if EMAIL_RESULT=$(printf '%b' "$BODY" | EMAIL="$SMTP_FROM_NAME <$SMTP_FROM>" mutt -F "$MUTTRC" -s "$SUBJECT" $ATTACHMENT "$BACKUP_EMAIL_TO" 2>&1); then
+    log "$(printf "Sent e-mail (%b) to %b" "$SUBJECT" "$BACKUP_EMAIL_TO")"
   else
-    printf "Email error: %b\n" "$EMAIL_RESULT" >> $LOG
+    log_error "$(printf "Email error: %b" "$EMAIL_RESULT")"
   fi
 }
 
@@ -131,9 +135,9 @@ To restore, untar in the Bitwarden data directory:
 
 
   BODY=$EMAIL_BODY_TAR
-  [ "$EXT" == "aes256" ] && BODY="$BODY\n\n $EMAIL_BODY_AES"
+  [ "$EXT" = "aes256" ] && BODY="$BODY\n\n $EMAIL_BODY_AES"
 
-  printf "$BODY"
+  printf '%b' "$BODY"
 }
 
 ###### Backup Functions ######################################################################
@@ -158,7 +162,7 @@ rclone_init() {
   chown root:root $RCLONE
   chmod 755 $RCLONE
 
-  printf "Rclone installed to %b\n" "$RCLONE" >> $LOG
+  log "$(printf "Rclone installed to %b" "$RCLONE")"
 }
 
 # make_backup
@@ -183,7 +187,7 @@ make_backup() {
   SQL_BACKUP_DIR="/tmp"
   SQL_BACKUP_NAME=$SQL_BACKUP_DIR/$SQL_NAME
   if ! sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"; then
-    printf "Error: Failed to backup SQLite database\n" >> $LOG
+    log_error "Failed to backup SQLite database"
     return 1
   fi
 
@@ -191,28 +195,29 @@ make_backup() {
   cd /
   DATA="data"
   FILES=""
-  FILES="$FILES $([ -d $DATA/attachments ] && echo $DATA/attachments)"
-  FILES="$FILES $([ -d $DATA/sends ] && echo $DATA/sends)"
-  FILES="$FILES $([ -r $DATA/config.json ] && echo $DATA/config.json)"
-  FILES="$FILES $([ -r $DATA/rsa_key.der -o -r $DATA/rsa_key.pem -o -r $DATA/rsa_key.pub.der ] && echo $DATA/rsa_key*)"
+  FILES="$FILES $([ -d "$DATA/attachments" ] && echo $DATA/attachments)"
+  FILES="$FILES $([ -d "$DATA/sends" ] && echo $DATA/sends)"
+  FILES="$FILES $([ -r "$DATA/config.json" ] && echo $DATA/config.json)"
+  FILES="$FILES $([ -r "$DATA/rsa_key.der" -o -r "$DATA/rsa_key.pem" -o -r "$DATA/rsa_key.pub.der" ] && echo $DATA/rsa_key*)"
 
-  FILES="$FILES $([ -r .env ] && [ "$BACKUP_ENV" == "true" ] && echo .env)"
+  FILES="$FILES $([ -r .env ] && [ "$BACKUP_ENV" = "true" ] && echo .env)"
 
   # tar up files and encrypt with openssl and encryption key
   BACKUP_DIR=/$DATA/backups
+  mkdir -p "$BACKUP_DIR"
   BACKUP_FILE=$BACKUP_DIR/"bw_backup_$(date "+%F-%H%M%S").tar.gz"
 
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    if ! tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
-      printf "Error: Failed to create encrypted backup\n" >> $LOG
+    if ! tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
+      log_error "$(printf "Failed to create encrypted backup")"
       rm -f $SQL_BACKUP_NAME
       return 1
     fi
   else
-    if ! tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME; then
-      printf "Error: Failed to create backup\n" >> $LOG
+    if ! tar czf "$BACKUP_FILE" -C / $FILES -C $SQL_BACKUP_DIR "$SQL_NAME"; then
+      log_error "$(printf "Failed to create tar backup")"
       rm -f $SQL_BACKUP_NAME
       return 1
     fi
@@ -269,8 +274,8 @@ backup(){
     rclone)
       # Handle rclone Backup
       printf "Running rclone backup\n" >> $LOG
-      # Initialize rclone if BACKUP=rclone and $(which rclone) is blank
-      if [ "$METHOD" == "rclone" -a -z "$(which rclone)" ]; then
+      # Initialize rclone if BACKUP=rclone and $(command -v rclone) is blank
+      if [ "$METHOD" = "rclone" -a -z "$(command -v rclone)" ]; then
         rclone_init
       fi
 
@@ -324,9 +329,9 @@ backup(){
 # Returns:
 #   0 on success; non-zero if container could not be stopped.
 stop_bitwarden() {
-  printf "Stopping vaultwarden container...\n" >> $LOG
+  log "$(printf "Stopping vaultwarden container...")"
   if ! docker stop bitwarden > /dev/null; then
-    printf "Warning: Could not stop bitwarden container. Restoration may fail if database is in use.\n" >> $LOG
+    log "$(printf "Could not stop bitwarden container. Restoration may fail if database is in use.")" "WARNING"
     return 1
   fi
   return 0
@@ -340,9 +345,9 @@ stop_bitwarden() {
 # Returns:
 #   0 on success; non-zero if the container failed to start.
 start_bitwarden() {
-  printf "Starting vaultwarden container...\n" >> $LOG
+  log "$(printf "Starting vaultwarden container...")"
   if ! docker start bitwarden > /dev/null; then
-    printf "Warning: Could not start bitwarden container. You may need to start it manually.\n" >> $LOG
+    log "$(printf "Could not start bitwarden container. You may need to start it manually")" "WARNING"
     return 1
   fi
   return 0
@@ -361,28 +366,33 @@ restore_backup() {
   BACKUP_FILE=$1
   
   if [ ! -f "$BACKUP_FILE" ]; then
-    printf "Error: Backup file %s not found.\n" "$BACKUP_FILE" >&2
+    log_error "$(printf "Error: Backup file %s not found" "$BACKUP_FILE")"
     exit 1
   fi
   
-  printf "Attempting to restore from %s\n" "$BACKUP_FILE" >> $LOG
+  # Create backup using existing local backup function
+  log "Creating backup of current state before restoration..."
+
+  log "$(printf "Attempting to restore from %s" "$BACKUP_FILE")"
   
   # Create a temporary directory for extraction
   RESTORE_TMP_DIR=$(mktemp -d)
   
   # Check if this is an encrypted backup
   if [ "${BACKUP_FILE%.aes256}" != "$BACKUP_FILE" ]; then
-    printf "Detected encrypted backup file.\n" >> $LOG
+    log "Detected encrypted backup file."
     
     # Check for decryption key in environment variables first
     if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
       DECRYPT_KEY="$BACKUP_ENCRYPTION_KEY"
-      printf "Using encryption key from environment variable.\n" >> $LOG
+      log "Using encryption key from environment variable."
     else
       # No key in environment, try interactive prompt
       if [ -t 0 ]; then
         printf "Enter decryption key: "
-        read -r -s DECRYPT_KEY
+        stty -echo
+        read -r DECRYPT_KEY
+        stty echo
         echo # Add newline after password input
         
         # Verify key was entered
@@ -392,25 +402,24 @@ restore_backup() {
           exit 1
         fi
       else
-        printf "Error: No encryption key available. Cannot prompt in non-interactive mode.\n" >&2
-        printf "Please provide the key via BACKUP_ENCRYPTION_KEY environment variable.\n" >&2
+        log_error "No decryption key available. Cannot prompt in non-interactive mode. Please provide the key via BACKUP_ENCRYPTION_KEY environment variable."
         rm -rf "$RESTORE_TMP_DIR"
         exit 1
       fi
     fi
     
     # Decrypt and extract
-    printf "Decrypting backup file...\n" >> $LOG
+    log "$(printf "Decrypting backup file %s..." "$BACKUP_FILE")"
     if ! openssl enc -d -aes256 -salt -pbkdf2 -pass pass:"${DECRYPT_KEY}" -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
-      printf "Error: Failed to decrypt or extract the backup file.\n" >&2
+      log_error "Failed to decrypt or extract the backup file. Exiting"
       rm -rf "$RESTORE_TMP_DIR"
       exit 1
     fi
   else
     # Extract unencrypted backup
-    printf "Extracting backup file...\n" >> $LOG
+    log "$(printf "Extracting backup file...")"
     if ! tar xzf "$BACKUP_FILE" -C "$RESTORE_TMP_DIR"; then
-      printf "Error: Failed to extract the backup file.\n" >&2
+      log_error "Failed to extract the backup file. Exiting"
       rm -rf "$RESTORE_TMP_DIR"
       exit 1
     fi
@@ -429,10 +438,7 @@ restore_backup() {
       BITWARDEN_STOPPED=1
     fi
   else
-    printf "Docker command not found. Cannot stop/start bitwarden container.\n" >> $LOG
-    printf "Docker command not found. Please stop the bitwarden container manually before continuing.\n"
-    printf "Run: docker stop bitwarden\n"
-    printf "And after restore completes: docker start bitwarden\n"
+    log "Docker command not found. Cannot stop/start bitwarden container." "WARNING"
   fi
   
   # Create a timestamp for backup files
@@ -440,7 +446,7 @@ restore_backup() {
   
   # Restore the SQLite database
   if [ -f "$RESTORE_TMP_DIR/db.sqlite3" ]; then
-    printf "Restoring database...\n" >> $LOG
+    log "Restoring database..."
     if [ -f "/data/db.sqlite3" ]; then
       rm -f "/data/db.sqlite3"
     fi
@@ -449,25 +455,31 @@ restore_backup() {
     cp "$RESTORE_TMP_DIR/db.sqlite3" "/data/db.sqlite3"
     RET_CODE=$?
     if [ $RET_CODE -ne 0 ]; then
-      printf "Error: Failed to restore database.\n" >&2
+      log_error "Failed to restore database. Exiting"
+      rm -rf "$RESTORE_TMP_DIR"
+      exit 1
     else
-      printf "Database restored successfully.\n" >> $LOG
+      log "Database restored successfully."
       # Set correct permissions for db file
       chmod 644 "/data/db.sqlite3" || true
     fi
   else
-    printf "Warning: Could not find database in backup.\n" >> $LOG
+    log_error "Could not find database in backup."
+    rm -rf "$RESTORE_TMP_DIR"
+    exit 1
   fi
   
   # Restore other files and directories
-  printf "Restoring data files...\n" >> $LOG
-  
+
+  log "Restoring data files..."
+  RESTORE_FAILURE=$(printf "Because the database has been restored, you may need to manually restore the emergency backup at %s." "$EMERGENCY_BACKUP")
+
   # Restore attachments
   if [ -d "$RESTORE_TMP_DIR/data/attachments" ]; then
     if [ -d "/data/attachments" ]; then
       rm -rf "/data/attachments"
     fi
-    cp -r "$RESTORE_TMP_DIR/data/attachments" "/data/" || printf "Failed to restore attachments.\n" >> $LOG
+    cp -r "$RESTORE_TMP_DIR/data/attachments" "/data/" || log "$(printf "Failed to restore attachments. %s" "$RESTORE_FAILURE")" "WARNING"
   fi
   
   # Restore sends
@@ -475,7 +487,7 @@ restore_backup() {
     if [ -d "/data/sends" ]; then
       rm -rf "/data/sends"
     fi
-    cp -r "$RESTORE_TMP_DIR/data/sends" "/data/" || printf "Failed to restore sends.\n" >> $LOG
+    cp -r "$RESTORE_TMP_DIR/data/sends" "/data/" || log "$(printf "Failed to restore sends. %s" "$RESTORE_FAILURE")" "WARNING"
   fi
   
   # Restore config.json
@@ -483,7 +495,7 @@ restore_backup() {
     if [ -f "/data/config.json" ]; then
       rm -f "/data/config.json"
     fi
-    cp "$RESTORE_TMP_DIR/data/config.json" "/data/" || printf "Failed to restore config.json.\n" >> $LOG
+    cp "$RESTORE_TMP_DIR/data/config.json" "/data/" || log "$(printf "Failed to restore config.json. %s" "$RESTORE_FAILURE")" "WARNING"
   fi
   
   # Restore RSA keys
@@ -495,7 +507,7 @@ restore_backup() {
         if [ -f "/data/$KEY_FILENAME" ]; then
           rm -f "/data/$KEY_FILENAME"
         fi
-        cp "$key_file" "/data/" || printf "Failed to restore %s.\n" "$KEY_FILENAME" >> $LOG
+        cp "$key_file" "/data/" || log "$(printf "Failed to restore %s. %s" "$KEY_FILENAME" "$RESTORE_FAILURE")" "WARNING"
       fi
     done
   fi
@@ -528,8 +540,7 @@ restore_backup() {
     NOTE: Only do this if you want to completely replace your current environment settings!
     ---------------------------------------------------------------------------------"
     
-    printf "%s\n" "$INSTRUCTIONS" >> $LOG
-    printf "%s\n" "$INSTRUCTIONS"
+    log "$INSTRUCTIONS"
   fi
   
   # Clean up
@@ -540,8 +551,7 @@ restore_backup() {
     start_bitwarden
   fi
   
-  printf "Restore completed.\n" >> $LOG
-  printf "Restore completed.\n"
+  log "Restore completed"
 }
 
 ###### Main Execution ########################################################################

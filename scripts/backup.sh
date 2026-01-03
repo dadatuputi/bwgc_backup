@@ -6,6 +6,8 @@
 
 LOG=/var/log/backup.log
 MUTTRC=/tmp/muttrc
+DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
+export DOCKER_API_VERSION
 
 # Bitwarden Email settings - usually provided as environment variables for but may be set below:
 # SMTP_HOST=
@@ -21,11 +23,54 @@ AUTH_METHOD=LOGIN
 # BACKUP_EMAIL_TO=
 # BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY=
 
+###### Utility Functions #####################################################################
+
+# log
+# Args:
+#   $1 - MESSAGE: The log message text (string)
+#   $2 - LEVEL: Optional log level (INFO|WARNING|ERROR). Defaults to INFO.
+# Behavior:
+#   Writes the message to stdout (INFO) or stderr (WARNING/ERROR) and
+#   appends the same message to the file at $LOG.
+# Returns:
+#   Always returns 0 (used for side-effect logging).
+log() {
+  MESSAGE=$1
+  LEVEL=${2:-INFO}
+
+  # Build a single-line message and explicitly add newlines when printing
+  MSG_PREFIX=$(printf "%s: %s" "$LEVEL" "$MESSAGE")
+
+  case "$LEVEL" in
+    ERROR|WARNING)
+      # Errors and warnings should be visible on stderr
+      printf '%s\n' "$MSG_PREFIX" >&2
+      ;;
+    *)
+      # Informational messages go to stdout
+      printf '%s\n' "$MSG_PREFIX"
+      ;;
+  esac
+
+  printf '%s\n' "$MSG_PREFIX" >> "$LOG"
+}
+
+# log_error
+# Args:
+#   $1 - MESSAGE: The error message text.
+# Behavior:
+#   Convenience wrapper around log() that emits an ERROR-level message.
+# Returns:
+#   Same as log() (0) after emitting the message.
+log_error() {
+  log "$1" "ERROR"
+}
+
 ###### E-mail Functions ######################################################################
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "$1" == "email" -o "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ ! -f "$MUTTRC" ]; then
-  if [ "$SMTP_SECURITY" == "force_tls" ]; then
+if [ "$1" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
+  if [ "$SMTP_SECURITY" = "force_tls" ]; then
     MUTT_SSL_KEY=ssl_force_tls
     SMTP_PROTO=smtps
   else
@@ -37,31 +82,46 @@ set ${MUTT_SSL_KEY}=yes
 set smtp_url="${SMTP_PROTO}://${SMTP_USERNAME}@${SMTP_HOST}:${SMTP_PORT}"
 set smtp_pass="${SMTP_PASSWORD}"
 EOF
-  printf "Finished configuring email.\n" >$LOG
+  log "Finished configuring email."
 fi
 
-# Send an email
-# $1: subject
-# $2: body
-# $3: attachment
+# email_send
+# Args:
+#   $1 - SUBJECT: Subject line for the email
+#   $2 - BODY: Email body text (can contain newlines and escapes)
+#   $3 - ATTACHMENT: Optional path to an attachment file
+# Behavior:
+#   Sends an email using `mutt` configured via $MUTTRC. On success logs a sent message;
+#   on failure logs an ERROR with the mutt output.
+# Returns:
+#   0 on success (mutt exit 0); non-zero on failure (mutt non-zero).
 email_send() {
-  if [ -n "$3" ]; then
-    ATTACHMENT="-a $3 --"
+  SUBJECT=$1
+  BODY=$2
+  ATTACHMENT=$3
+
+  if [ -n "$ATTACHMENT" ]; then
+    ATTACHMENT="-a $ATTACHMENT --"
   else 
     ATTACHMENT=""
   fi
 
-  if EMAIL_RESULT=$(printf "$2" | EMAIL="$SMTP_FROM_NAME <$SMTP_FROM>" mutt -F "$MUTTRC" -s "$1" $ATTACHMENT "$BACKUP_EMAIL_TO" 2>&1); then
-    printf "Sent e-mail (%b) to %b\n" "$1" "$BACKUP_EMAIL_TO" >> $LOG
+  if EMAIL_RESULT=$(printf '%b' "$BODY" | EMAIL="$SMTP_FROM_NAME <$SMTP_FROM>" mutt -F "$MUTTRC" -s "$SUBJECT" $ATTACHMENT "$BACKUP_EMAIL_TO" 2>&1); then
+    log "$(printf "Sent e-mail (%b) to %b" "$SUBJECT" "$BACKUP_EMAIL_TO")"
   else
-    printf "Email error: %b\n" "$EMAIL_RESULT" >> $LOG
+    log_error "$(printf "Email error: %b" "$EMAIL_RESULT")"
   fi
 }
 
 
-# Build email body message
-# Print instructions to untar and unencrypt as needed
-# $1: backup filename
+
+# email_body
+# Args:
+#   $1 - FILENAME: The backup filename (used to compute instructions for tar/openssl)
+# Behavior:
+#   Prints an email-friendly body describing how to restore/decrypt the provided backup.
+# Returns:
+#   Writes the generated body to stdout.
 email_body() {
   EXT=${1##*.}
   FILE=${1%%.*}
@@ -77,15 +137,23 @@ To restore, untar in the Bitwarden data directory:
 
 
   BODY=$EMAIL_BODY_TAR
-  [ "$EXT" == "aes256" ] && BODY="$BODY\n\n $EMAIL_BODY_AES"
+  [ "$EXT" = "aes256" ] && BODY="$BODY\n\n $EMAIL_BODY_AES"
 
-  printf "$BODY"
+  printf '%b' "$BODY"
 }
 
 ###### Backup Functions ######################################################################
 
-# Initialize rclone
+
 RCLONE=/usr/bin/rclone
+# rclone_init
+# Args:
+#   None
+# Behavior:
+#   Installs `rclone` into $RCLONE (used only if rclone missing). Typically a no-op
+#   because the Dockerfile installs rclone. Logs installation progress.
+# Returns:
+#   0 on success; non-zero on failure during installation.
 rclone_init() {
   # Install rclone - https://wiki.alpinelinux.org/wiki/Rclone
   # rclone install now handled in Dockerfile, so this function should never be executed
@@ -96,10 +164,10 @@ rclone_init() {
   chown root:root $RCLONE
   chmod 755 $RCLONE
 
-  printf "Rclone installed to %b\n" "$RCLONE" >> $LOG
+  log "$(printf "Rclone installed to %b" "$RCLONE")"
 }
 
-
+# make_backup
 # Create backup and prune old backups
 # Borrowed heavily from https://github.com/shivpatel/bitwarden_rs-local-backup
 # with the addition of backing up:
@@ -107,13 +175,21 @@ rclone_init() {
 # * sends directory
 # * config.json
 # * rsa_key* files
+# Args:
+#   None
+# Behavior:
+#   Creates a compressed tarball of vaultwarden data (attachments, sends, config, rsa_key*, .env if enabled)
+#   and a temporary sqlite3 backup. If BACKUP_ENCRYPTION_KEY is set the tarball is encrypted with openssl.
+#   The created backup filename is printed to stdout on success.
+# Returns:
+#   0 on success (filename printed to stdout), non-zero on failure. Side-effects: writes file to $BACKUP_DIR.
 make_backup() {
   # use sqlite3 to create backup (avoids corruption if db write in progress)
   SQL_NAME="db.sqlite3"
   SQL_BACKUP_DIR="/tmp"
   SQL_BACKUP_NAME=$SQL_BACKUP_DIR/$SQL_NAME
   if ! sqlite3 /data/$SQL_NAME ".backup '$SQL_BACKUP_NAME'"; then
-    printf "Error: Failed to backup SQLite database\n" >> $LOG
+    log_error "Failed to backup SQLite database"
     return 1
   fi
 
@@ -121,41 +197,48 @@ make_backup() {
   cd /
   DATA="data"
   FILES=""
-  FILES="$FILES $([ -d $DATA/attachments ] && echo $DATA/attachments)"
-  FILES="$FILES $([ -d $DATA/sends ] && echo $DATA/sends)"
-  FILES="$FILES $([ -r $DATA/config.json ] && echo $DATA/config.json)"
-  FILES="$FILES $([ -r $DATA/rsa_key.der -o -r $DATA/rsa_key.pem -o -r $DATA/rsa_key.pub.der ] && echo $DATA/rsa_key*)"
+  FILES="$FILES $([ -d "$DATA/attachments" ] && echo $DATA/attachments)"
+  FILES="$FILES $([ -d "$DATA/sends" ] && echo $DATA/sends)"
+  FILES="$FILES $([ -r "$DATA/config.json" ] && echo $DATA/config.json)"
+  FILES="$FILES $([ -r "$DATA/rsa_key.der" -o -r "$DATA/rsa_key.pem" -o -r "$DATA/rsa_key.pub.der" ] && echo $DATA/rsa_key*)"
 
-  FILES="$FILES $([ -r .env ] && [ "$BACKUP_ENV" == "true" ] && echo .env)"
+  FILES="$FILES $([ -r .env ] && [ "$BACKUP_ENV" = "true" ] && echo .env)"
 
   # tar up files and encrypt with openssl and encryption key
   BACKUP_DIR=/$DATA/backups
+  mkdir -p "$BACKUP_DIR"
   BACKUP_FILE=$BACKUP_DIR/"bw_backup_$(date "+%F-%H%M%S").tar.gz"
 
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    if ! tar czf - -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
-      printf "Error: Failed to create encrypted backup\n" >> $LOG
+    if ! tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
+      log_error "$(printf "Failed to create encrypted backup")"
       rm -f $SQL_BACKUP_NAME
       return 1
     fi
   else
-    if ! tar czf $BACKUP_FILE -C / $FILES -C $SQL_BACKUP_DIR $SQL_NAME; then
-      printf "Error: Failed to create backup\n" >> $LOG
+    if ! tar czf "$BACKUP_FILE" -C / $FILES -C $SQL_BACKUP_DIR "$SQL_NAME"; then
+      log_error "$(printf "Failed to create tar backup")"
       rm -f $SQL_BACKUP_NAME
       return 1
     fi
   fi
-  printf "Backup file created at %b\n" "$BACKUP_FILE" >> $LOG
 
   # cleanup tmp folder
   rm -f $SQL_BACKUP_NAME
 
-  # rm any backups older than 30 days
-  find $BACKUP_DIR/* -mtime +$BACKUP_DAYS -exec rm {} \;
+  # rm any backups older than BACKUP_DAYS (only if BACKUP_DAYS is a positive integer)
+  case "$BACKUP_DAYS" in
+    ''|*[!0-9]*)
+      log "BACKUP_DAYS is not set or not a positive integer; skipping old-backup pruning" "WARNING"
+      ;;
+    *)
+      find "$BACKUP_DIR" -type f -mtime +"$BACKUP_DAYS" -exec rm -f {} \;
+      ;;
+  esac
 
-  printf "$BACKUP_FILE"
+  printf '%s' "$BACKUP_FILE"
   return 0
 }
 
@@ -163,48 +246,37 @@ make_backup() {
 ##############################################################################################
 # Main Backup 
 
+# backup
+# Args:
+#   $1 - METHOD: Backup method name (local, email, rclone)
+#   $2 - RESULT: Path to the backup file produced by make_backup()
+# Behavior:
+#   Performs method-specific actions (no-op for local, emails the file for email, rclones the file for rclone).
+# Returns:
+#   0 on success, non-zero on failure.
 backup(){
   METHOD=$1
   RESULT=$2
-  EXIT_CODE=$3
 
-  # If the backup generation failed (exit code != 0), handle failure notification immediately
-  if [ "$EXIT_CODE" -ne 0 ]; then
-    printf "%s backup skipped because archive creation failed.\n" "$METHOD" >> $LOG
-    
-    if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-       email_send "$SMTP_FROM_NAME - Backup Failed" "The backup creation process failed. Please check the logs at $LOG."
-    fi
-    return 1
-  fi
-
-  # If we are here, backup creation was successful ($EXIT_CODE is 0)
   case $METHOD in
     local)
-      printf "Running local backup\n" >> $LOG
-      if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
-        email_send "$SMTP_FROM_NAME - local backup completed" "Local backup completed"
-      fi
+      # Nothing additional to do for local backup
       ;;
 
     email)
-      # Handle E-mail Backup
-      printf "Running email backup\n" >> $LOG
-      # Backup and send e-mail
       if [ -n "$RESULT" ]; then
         FILENAME=$(basename $RESULT)
         BODY=$(email_body $FILENAME)
         email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT
       else
-        printf "Error: No result file to email.\n" >> $LOG
+        printf "No result file to email"
+        return 1
       fi
       ;;
 
     rclone)
-      # Handle rclone Backup
-      printf "Running rclone backup\n" >> $LOG
-      # Initialize rclone if BACKUP=rclone and $(which rclone) is blank
-      if [ "$METHOD" == "rclone" -a -z "$(which rclone)" ]; then
+      # Initialize rclone if BACKUP=rclone and $(command -v rclone) is blank
+      if [ "$METHOD" = "rclone" -a -z "$(command -v rclone)" ]; then
         rclone_init
       fi
 
@@ -226,78 +298,101 @@ backup(){
         done
 
         if [ $SYNC_FAILED_CNT -ne 0 ]; then
-          printf "Failed to sync to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b\n" "$SYNC_ERROR_LOG" >> $LOG
-          # Send failure email
-          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup failed" "Rclone backup failed to ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes.\n\nErrors:\n$SYNC_ERROR_LOG"
-          fi
-        else
-          # Success
-          if [ "$BACKUP_EMAIL_NOTIFY" == "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
-            email_send "$SMTP_FROM_NAME - rclone backup completed" "Rclone backup completed successfully to ${SYNC_TOTAL_CNT} remotes."
-          fi
+          printf "Failed to sync on ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b" "$SYNC_ERROR_LOG"
+          return 1
         fi
       else
-        printf "Rclone backup skipped - BACKUP_RCLONE_CONF not found or empty\n" >> $LOG
-        if [ "$BACKUP_EMAIL_NOTIFY" == "true" ]; then
-            email_send "$SMTP_FROM_NAME - rclone config error" "Rclone backup failed: Configuration file not found at $BACKUP_RCLONE_CONF."
-        fi
+        printf "Configuration file not found at $BACKUP_RCLONE_CONF"
+        return 1
       fi
       ;;
-
   esac
+
+  return 0
 }
 
 ###### Restore ###############################################################################
 
-# Function to stop the bitwarden container
+# stop_bitwarden
+# Args:
+#   None
+# Behavior:
+#   Attempts to stop the `bitwarden` Docker container using `docker stop`.
+# Returns:
+#   0 on success; non-zero if container could not be stopped.
 stop_bitwarden() {
-  printf "Stopping vaultwarden container...\n" >> $LOG
+  log "$(printf "Stopping vaultwarden container...")"
   if ! docker stop bitwarden > /dev/null; then
-    printf "Warning: Could not stop bitwarden container. Restoration may fail if database is in use.\n" >> $LOG
+    log "$(printf "Could not stop bitwarden container. Restoration may fail if database is in use.")" "WARNING"
     return 1
   fi
   return 0
 }
 
-# Function to start the bitwarden container
+# start_bitwarden
+# Args:
+#   None
+# Behavior:
+#   Attempts to start the `bitwarden` Docker container using `docker start`.
+# Returns:
+#   0 on success; non-zero if the container failed to start.
 start_bitwarden() {
-  printf "Starting vaultwarden container...\n" >> $LOG
+  log "$(printf "Starting vaultwarden container...")"
   if ! docker start bitwarden > /dev/null; then
-    printf "Warning: Could not start bitwarden container. You may need to start it manually.\n" >> $LOG
+    log "$(printf "Could not start bitwarden container. You may need to start it manually")" "WARNING"
     return 1
   fi
   return 0
 }
 
-# Restore a backup file
-# $1: path to backup file
+# restore_backup
+# Args:
+#   $1 - BACKUP_FILE: Path to the backup archive to restore (may be encrypted with .aes256)
+# Behavior:
+#   Creates an emergency backup of current data, decrypts (if necessary) and extracts the provided
+#   backup into a temporary directory, stops the running container, restores DB and data files,
+#   and restarts the container if it was stopped. Writes progress and errors to the log.
+# Returns:
+#   Exits with non-zero on fatal errors; returns 0 on successful completion.
 restore_backup() {
   BACKUP_FILE=$1
   
   if [ ! -f "$BACKUP_FILE" ]; then
-    printf "Error: Backup file %s not found.\n" "$BACKUP_FILE" >&2
+    log_error "$(printf "Error: Backup file %s not found" "$BACKUP_FILE")"
     exit 1
   fi
   
-  printf "Attempting to restore from %s\n" "$BACKUP_FILE" >> $LOG
+  # Create backup using existing local backup function
+  log "Creating backup of current state before restoration..."
+
+  EMERGENCY_BACKUP=$(make_backup)
+  BACKUP_EXIT_CODE=$?
+
+  if [ $BACKUP_EXIT_CODE -ne 0 ]; then
+    log_error "Safety backup failed! Exiting."
+    exit $BACKUP_EXIT_CODE
+  fi
+
+  log "$(printf "Attempting to restore from %s" "$BACKUP_FILE")"
   
   # Create a temporary directory for extraction
   RESTORE_TMP_DIR=$(mktemp -d)
   
   # Check if this is an encrypted backup
   if [ "${BACKUP_FILE%.aes256}" != "$BACKUP_FILE" ]; then
-    printf "Detected encrypted backup file.\n" >> $LOG
+    log "Detected encrypted backup file."
     
     # Check for decryption key in environment variables first
     if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
       DECRYPT_KEY="$BACKUP_ENCRYPTION_KEY"
-      printf "Using encryption key from environment variable.\n" >> $LOG
+      log "Using encryption key from environment variable."
     else
       # No key in environment, try interactive prompt
       if [ -t 0 ]; then
         printf "Enter decryption key: "
-        read -r -s DECRYPT_KEY
+        stty -echo
+        read -r DECRYPT_KEY
+        stty echo
         echo # Add newline after password input
         
         # Verify key was entered
@@ -307,35 +402,29 @@ restore_backup() {
           exit 1
         fi
       else
-        printf "Error: No encryption key available. Cannot prompt in non-interactive mode.\n" >&2
-        printf "Please provide the key via BACKUP_ENCRYPTION_KEY environment variable.\n" >&2
+        log_error "No decryption key available. Cannot prompt in non-interactive mode. Please provide the key via BACKUP_ENCRYPTION_KEY environment variable."
         rm -rf "$RESTORE_TMP_DIR"
         exit 1
       fi
     fi
     
     # Decrypt and extract
-    printf "Decrypting backup file...\n" >> $LOG
+    log "$(printf "Decrypting backup file %s..." "$BACKUP_FILE")"
     if ! openssl enc -d -aes256 -salt -pbkdf2 -pass pass:"${DECRYPT_KEY}" -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
-      printf "Error: Failed to decrypt or extract the backup file.\n" >&2
+      log_error "Failed to decrypt or extract the backup file. Exiting"
       rm -rf "$RESTORE_TMP_DIR"
       exit 1
     fi
   else
     # Extract unencrypted backup
-    printf "Extracting backup file...\n" >> $LOG
+    log "$(printf "Extracting backup file...")"
     if ! tar xzf "$BACKUP_FILE" -C "$RESTORE_TMP_DIR"; then
-      printf "Error: Failed to extract the backup file.\n" >&2
+      log_error "Failed to extract the backup file. Exiting"
       rm -rf "$RESTORE_TMP_DIR"
       exit 1
     fi
   fi
   
-  # Create backup using existing local backup function
-  printf "Creating backup of current state before restoration...\n" >> $LOG
-  if ! make_backup > /dev/null; then
-    printf "Warning: Safety backup failed! Proceeding anyway...\n" >> $LOG
-  fi
   
   # Stop the bitwarden container before restoration
   BITWARDEN_STOPPED=0
@@ -344,10 +433,7 @@ restore_backup() {
       BITWARDEN_STOPPED=1
     fi
   else
-    printf "Docker command not found. Cannot stop/start bitwarden container.\n" >> $LOG
-    printf "Docker command not found. Please stop the bitwarden container manually before continuing.\n"
-    printf "Run: docker stop bitwarden\n"
-    printf "And after restore completes: docker start bitwarden\n"
+    log "Docker command not found. Cannot stop/start bitwarden container." "WARNING"
   fi
   
   # Create a timestamp for backup files
@@ -355,7 +441,7 @@ restore_backup() {
   
   # Restore the SQLite database
   if [ -f "$RESTORE_TMP_DIR/db.sqlite3" ]; then
-    printf "Restoring database...\n" >> $LOG
+    log "Restoring database..."
     if [ -f "/data/db.sqlite3" ]; then
       rm -f "/data/db.sqlite3"
     fi
@@ -364,25 +450,31 @@ restore_backup() {
     cp "$RESTORE_TMP_DIR/db.sqlite3" "/data/db.sqlite3"
     RET_CODE=$?
     if [ $RET_CODE -ne 0 ]; then
-      printf "Error: Failed to restore database.\n" >&2
+      log_error "Failed to restore database. Exiting"
+      rm -rf "$RESTORE_TMP_DIR"
+      exit 1
     else
-      printf "Database restored successfully.\n" >> $LOG
+      log "Database restored successfully."
       # Set correct permissions for db file
       chmod 644 "/data/db.sqlite3" || true
     fi
   else
-    printf "Warning: Could not find database in backup.\n" >> $LOG
+    log_error "Could not find database in backup."
+    rm -rf "$RESTORE_TMP_DIR"
+    exit 1
   fi
   
   # Restore other files and directories
-  printf "Restoring data files...\n" >> $LOG
-  
+
+  log "Restoring data files..."
+  RESTORE_FAILURE=$(printf "Because the database has been restored, you may need to manually restore the emergency backup at %s." "$EMERGENCY_BACKUP")
+
   # Restore attachments
   if [ -d "$RESTORE_TMP_DIR/data/attachments" ]; then
     if [ -d "/data/attachments" ]; then
       rm -rf "/data/attachments"
     fi
-    cp -r "$RESTORE_TMP_DIR/data/attachments" "/data/" || printf "Failed to restore attachments.\n" >> $LOG
+    cp -r "$RESTORE_TMP_DIR/data/attachments" "/data/" || log "$(printf "Failed to restore attachments. %s" "$RESTORE_FAILURE")" "WARNING"
   fi
   
   # Restore sends
@@ -390,7 +482,7 @@ restore_backup() {
     if [ -d "/data/sends" ]; then
       rm -rf "/data/sends"
     fi
-    cp -r "$RESTORE_TMP_DIR/data/sends" "/data/" || printf "Failed to restore sends.\n" >> $LOG
+    cp -r "$RESTORE_TMP_DIR/data/sends" "/data/" || log "$(printf "Failed to restore sends. %s" "$RESTORE_FAILURE")" "WARNING"
   fi
   
   # Restore config.json
@@ -398,7 +490,7 @@ restore_backup() {
     if [ -f "/data/config.json" ]; then
       rm -f "/data/config.json"
     fi
-    cp "$RESTORE_TMP_DIR/data/config.json" "/data/" || printf "Failed to restore config.json.\n" >> $LOG
+    cp "$RESTORE_TMP_DIR/data/config.json" "/data/" || log "$(printf "Failed to restore config.json. %s" "$RESTORE_FAILURE")" "WARNING"
   fi
   
   # Restore RSA keys
@@ -410,7 +502,7 @@ restore_backup() {
         if [ -f "/data/$KEY_FILENAME" ]; then
           rm -f "/data/$KEY_FILENAME"
         fi
-        cp "$key_file" "/data/" || printf "Failed to restore %s.\n" "$KEY_FILENAME" >> $LOG
+        cp "$key_file" "/data/" || log "$(printf "Failed to restore %s. %s" "$KEY_FILENAME" "$RESTORE_FAILURE")" "WARNING"
       fi
     done
   fi
@@ -418,7 +510,9 @@ restore_backup() {
   # Restore .env file if it was backed up
   if [ -f "$RESTORE_TMP_DIR/.env" ] && [ "$BACKUP_ENV" = "true" ]; then
     # Copy to a location that's accessible but won't cause conflicts
-    cp "$RESTORE_TMP_DIR/.env" "/data/.env.restored" || printf "Failed to copy .env to reference location.\n" >> $LOG
+    FILENAME=".env.restored"
+    REF_LOCATION=$(printf "/data/%b" "$FILENAME")
+    cp "$RESTORE_TMP_DIR/.env" "$REF_LOCATION" || log "$(printf "Failed to copy .env to %s" "$REF_LOCATION")" "WARNING"
     
     # Print detailed instructions for the user
     INSTRUCTIONS="
@@ -428,23 +522,22 @@ restore_backup() {
     
     The .env file cannot be automatically restored while Docker Compose is running.
     A copy of the restored .env file has been placed at:
-      bitwarden/.env.restored
+      bitwarden/$FILENAME
     
     To complete the restoration process manually:
     
     1. Review the differences between your current .env and the restored version:
-       diff .env bitwarden/.env.restored
+       diff .env bitwarden/$FILENAME
     
     2. To fully apply the restored .env:
        a. Stop all services: docker-compose down
-       b. Replace your .env file: cp bitwarden/.env.restored .env
+       b. Replace your .env file: cp bitwarden/$FILENAME .env
        c. Restart services: docker-compose up -d
     
     NOTE: Only do this if you want to completely replace your current environment settings!
     ---------------------------------------------------------------------------------"
     
-    printf "%s\n" "$INSTRUCTIONS" >> $LOG
-    printf "%s\n" "$INSTRUCTIONS"
+    log "$INSTRUCTIONS"
   fi
   
   # Clean up
@@ -455,57 +548,87 @@ restore_backup() {
     start_bitwarden
   fi
   
-  printf "Restore completed.\n" >> $LOG
-  printf "Restore completed.\n"
+  log "Restore completed"
 }
 
 ###### Main Execution ########################################################################
 
 COMMAND_ERROR=0
+USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n")
+VALID="local email rclone"
 
 case "$1" in
   restore)
     if [ -z "$2" ]; then
-      printf "Error: No backup file specified.\n" >&2
-      printf "Usage: $0 restore <backup_file>\n" >&2
+      log_error "No backup file specified."
+      printf '%b\n' "$USAGE" >&2
       exit 1
     fi
     restore_backup "$2"
     ;;
-  local|email|rclone|*)
-    VALID="local email rclone"
-    printf "Performing backup to: %b\n" "$1" >> $LOG
-    printf "Performing backup to: %b\n" "$1"
+  *)
+    # Check for extraneous arguments
+    if [ -n "$2" ]; then
+      log_error "Error: Unexpected argument '$2'. Only one backup method argument is allowed."
+      printf '%b\n' "$USAGE" >&2
+      exit 1
+    fi
     
-    for METHOD in ${1//,/ }
-    do
-      # check if provided backup method is valid
-      if echo $VALID | grep -q -w "$METHOD"; then 
-        if [ ! -n "$RESULT" ]; then
-          # Capture result (filename) AND the exit code separately
-          RESULT=$(make_backup)
-          BACKUP_EXIT_CODE=$?
+    # validate backup methods - fail fast
+    METHODS=$(printf "%s" "$1" | tr ',' ' ')
+    for METHOD in $METHODS; do
+      if ! echo $VALID | grep -q -w "$METHOD"; then
+        ERROR=$(printf "Invalid backup method '%s'; backup failed\n" "$METHOD")
+        log_error "$ERROR"
+        printf '%b\n' "$USAGE" >&2
+        if [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+          email_send "$SMTP_FROM_NAME - Backup Failed" "$ERROR"
         fi
-        
-        # We pass the exit code to backup function
-        backup "$METHOD" "$RESULT" "$BACKUP_EXIT_CODE"
-        
-        if [ $BACKUP_EXIT_CODE -eq 0 ]; then
-            printf "Completed backup to: %b\n" "$METHOD" >> $LOG
-            printf "Completed backup to: %b\n" "$METHOD" >&2
-        else
-            printf "Backup failed for method: %b\n" "$METHOD" >> $LOG
-            printf "Backup failed for method: %b\n" "$METHOD" >&2
-        fi
-      else
-        COMMAND_ERROR=1
-        printf "Bad backup method provided: %b\n" "$METHOD" >> $LOG
-        printf "Bad backup method provided: %b\n" "$METHOD" >&2
+        exit 1
       fi
     done
 
-    if [ "$COMMAND_ERROR" = 1 ]; then
-      printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n" >&2
+    # create backup file
+    # capture result (filename) AND the exit code separately
+    # send notification & exit if backup failed
+    RESULT=$(make_backup)
+    BACKUP_EXIT_CODE=$?
+    if [ $BACKUP_EXIT_CODE -eq 0 ]; then
+      log "$(printf "Created backup at: %s" "$RESULT")"
+    else
+      ERROR="Backup creation failed. Check the logs for additional details."
+      log_error "$ERROR"
+      if [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+        email_send "$SMTP_FROM_NAME - Backup Failed" "$ERROR"
+      fi
+      exit 1
+    fi
+    
+    SUCCESSFUL_BACKUPS=""
+    for METHOD in $METHODS; do
+      log "$(printf "Performing '%s' backup..." "$METHOD")"
+
+      # We pass the exit code to backup function
+      if ERROR=$(backup "$METHOD" "$RESULT"); then
+        SUCCESSFUL_BACKUPS="$SUCCESSFUL_BACKUPS $METHOD"
+        log "$(printf "Backup to %b completed" "$METHOD")"
+      else
+        ERROR="$(printf "Backup via %b failed: %b" "$METHOD" "$ERROR")"
+        log_error "$ERROR"
+        if [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+          email_send "$SMTP_FROM_NAME - $METHOD Backup Failed" "$ERROR"
+        fi
+      fi
+    done
+
+    if [ -n "$SUCCESSFUL_BACKUPS" ]; then
+      if [ "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
+        BODY="Backup completed successfully via: $SUCCESSFUL_BACKUPS"
+        email_send "$SMTP_FROM_NAME - Backup Successful" "$BODY" "$RESULT"
+      fi
+    else
+      log_error "All backup methods failed."
+      exit 1
     fi
     ;;
 esac

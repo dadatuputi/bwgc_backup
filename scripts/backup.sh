@@ -4,15 +4,20 @@
 # Copyright (C) 2021 Bradford Law
 # Licensed under the terms of MIT
 
+# set -u is on: an unset variable is an error rather than an empty string. In a
+# script that builds rm and cp targets by interpolation, a typo silently
+# expanding to nothing is the failure mode worth catching. Every optional
+# setting is given an explicit default below, so absence stays a supported
+# state -- a deployment that uses neither rclone nor e-mail is normal.
+#
+# set -e is deliberately NOT set. "cmd || fallback" and functions returning
+# non-zero are used as ordinary control flow throughout, so enabling it would
+# change the meaning of existing code rather than catch bugs in it. The
+# destructive paths check their exit codes explicitly instead.
+set -u
+
 # Optional settings, defaulted so their absence is a documented state rather
 # than an accident of shell behaviour, and so a typo in a name fails visibly.
-#
-# This is also the prerequisite for enabling set -u later. set -u is NOT on
-# today: roughly two dozen settings are referenced bare and a deployment that
-# does not use rclone or e-mail leaves them unset on purpose, so turning it on
-# now would break those deployments rather than catch a bug. set -e is likewise
-# declined: "cmd || fallback" and functions returning non-zero are used as
-# ordinary control flow throughout, so it would change meaning, not add safety.
 : "${BACKUP_EMAIL_NOTIFY:=false}"
 : "${BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY:=false}"
 : "${BACKUP_EMAIL_TO:=}"
@@ -24,6 +29,7 @@
 : "${RESTORE_FORCE:=false}"
 : "${BACKUP_MAX_AGE_DAYS:=8}"
 : "${CHECK_STATE_FILE:=/data/backups/.last-status-alert}"
+: "${METADATA_HOST:=metadata.google.internal}"
 
 LOG=/var/log/backup.log
 MUTTRC=/tmp/muttrc
@@ -90,7 +96,7 @@ log_error() {
 ###### E-mail Functions ######################################################################
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "$1" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
+if [ "${1:-}" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
   if [ "$SMTP_SECURITY" = "force_tls" ]; then
     MUTT_SSL_KEY=ssl_force_tls
     SMTP_PROTO=smtps
@@ -228,7 +234,18 @@ make_backup() {
   # tar up files and encrypt with openssl and encryption key
   BACKUP_DIR=/$DATA/backups
   mkdir -p "$BACKUP_DIR"
-  BACKUP_FILE=$BACKUP_DIR/"bw_backup_$(date "+%F-%H%M%S").tar.gz"
+  # Names are second-resolution, so two backups in the same second would
+  # collide. That is not hypothetical: restore_backup takes an emergency backup
+  # into this same directory, and a collision there overwrites the very archive
+  # being restored from -- the restore then silently reinstates the current
+  # database instead of the backup, and the backup is gone. Never overwrite.
+  BACKUP_BASE="bw_backup_$(date "+%F-%H%M%S")"
+  _suffix=0
+  while [ -e "$BACKUP_DIR/$BACKUP_BASE.tar.gz" ] || [ -e "$BACKUP_DIR/$BACKUP_BASE.tar.gz.aes256" ]; do
+    _suffix=$((_suffix + 1))
+    BACKUP_BASE="bw_backup_$(date "+%F-%H%M%S")-$_suffix"
+  done
+  BACKUP_FILE=$BACKUP_DIR/"$BACKUP_BASE.tar.gz"
 
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
@@ -649,8 +666,9 @@ COMMAND_ERROR=0
 #   Queries the GCE metadata server. Returns empty on any failure, including
 #   when running somewhere that is not GCE.
 metadata() {
+  # METADATA_HOST is overridable so tests can simulate running outside GCE.
   curl -s -m 5 -H "Metadata-Flavor: Google" \
-    "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
+    "http://${METADATA_HOST:-metadata.google.internal}/computeMetadata/v1/$1" 2>/dev/null
 }
 
 # cos_family_status
@@ -670,6 +688,31 @@ cos_family_status() {
   [ -n "$_tok" ] || { printf '000'; return 1; }
   curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_tok" \
     "https://compute.googleapis.com/compute/v1/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
+}
+
+# alpine_eol_date
+# Behavior:
+#   Prints the end-of-support date for the Alpine branch this image is built
+#   on, from Alpine's own releases.json. Empty if it cannot be determined.
+#
+#   The image pins a branch (alpine:3.24) rather than :latest, so upstream
+#   security patches still arrive automatically through the daily base-image
+#   rebuild, while a major version bump stays a deliberate act. The cost of
+#   that choice is that the branch eventually leaves support, and nothing would
+#   otherwise say so. This is that alarm.
+#
+#   No jq in this image, so both keys are extracted in document order and
+#   paired. eol_date follows rel_branch within each branch object.
+alpine_eol_date() {
+  _branch="v$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1,2)"
+  [ "$_branch" != "v" ] || return 0
+  curl -s -m 20 "${ALPINE_RELEASES_URL:-https://alpinelinux.org/releases.json}" 2>/dev/null \
+    | tr ',' '\n' \
+    | grep -oE '"(rel_branch|eol_date)": *"[^"]*"' \
+    | grep -A1 "\"rel_branch\": *\"$_branch\"" \
+    | grep '"eol_date"' \
+    | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' \
+    | head -1
 }
 
 # check_status
@@ -725,6 +768,26 @@ check_status() {
     fi
   fi
 
+  # --- Alpine branch support ---
+  AL_EOL=$(alpine_eol_date)
+  if [ -n "$AL_EOL" ]; then
+    TODAY=$(date +%F)
+    SOON=$(date -d "@$(( $(date +%s) + 15552000 ))" +%F 2>/dev/null || printf '%s' "$TODAY")
+    if [ "$AL_EOL" \< "$TODAY" ]; then
+      PROBLEMS="$PROBLEMS alpine-eol"
+      REPORT="$REPORT$(printf 'The Alpine branch this backup image is built on left support on %s.\n\nIt no longer receives security patches, so the daily base-image rebuild has\nnothing to pull. Bump the FROM line in the Dockerfile to a supported branch.\n' "$AL_EOL")
+
+"
+    elif [ "$AL_EOL" \< "$SOON" ]; then
+      PROBLEMS="$PROBLEMS alpine-eol-soon"
+      REPORT="$REPORT$(printf 'The Alpine branch this backup image is built on leaves support on %s,\nwithin the next six months. Plan a bump of the FROM line in the Dockerfile.\n' "$AL_EOL")
+
+"
+    else
+      log "$(printf "Alpine branch is supported until %s." "$AL_EOL")"
+    fi
+  fi
+
   # --- backup freshness ---
   NEWEST=$(ls -t /data/backups/bw_backup_* 2>/dev/null | head -1)
   if [ -z "$NEWEST" ]; then
@@ -764,29 +827,31 @@ check_status() {
 USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>|check}\n")
 VALID="local email rclone"
 
-case "$1" in
+# ${1:-} throughout: with set -u a bare $1 is fatal when the script is
+# invoked with no arguments, which is exactly when it should print usage.
+case "${1:-}" in
   check)
     check_status
     exit $?
     ;;
   restore)
-    if [ -z "$2" ]; then
+    if [ -z "${2:-}" ]; then
       log_error "No backup file specified."
       printf '%b\n' "$USAGE" >&2
       exit 1
     fi
-    restore_backup "$2"
+    restore_backup "${2:-}"
     ;;
   *)
     # Check for extraneous arguments
-    if [ -n "$2" ]; then
-      log_error "Error: Unexpected argument '$2'. Only one backup method argument is allowed."
+    if [ -n "${2:-}" ]; then
+      log_error "Error: Unexpected argument '${2:-}'. Only one backup method argument is allowed."
       printf '%b\n' "$USAGE" >&2
       exit 1
     fi
     
     # validate backup methods - fail fast
-    METHODS=$(printf "%s" "$1" | tr ',' ' ')
+    METHODS=$(printf "%s" "${1:-}" | tr ',' ' ')
     for METHOD in $METHODS; do
       if ! echo $VALID | grep -q -w "$METHOD"; then
         ERROR=$(printf "Invalid backup method '%s'; backup failed\n" "$METHOD")

@@ -212,21 +212,25 @@ make_backup() {
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    if ! tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
+    # -pass env: rather than pass:. Command-line arguments are readable from
+    # /proc/<pid>/cmdline by anything else in the container, and an unquoted
+    # expansion also breaks on a key containing spaces or shell metacharacters.
+    if ! BW_KEY="$BACKUP_ENCRYPTION_KEY" tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" \
+        | BW_KEY="$BACKUP_ENCRYPTION_KEY" openssl enc -e -aes256 -salt -pbkdf2 -pass env:BW_KEY -out "$BACKUP_FILE"; then
       log_error "$(printf "Failed to create encrypted backup")"
-      rm -f $SQL_BACKUP_NAME
+      rm -f "$SQL_BACKUP_NAME"
       return 1
     fi
   else
     if ! tar czf "$BACKUP_FILE" -C / $FILES -C $SQL_BACKUP_DIR "$SQL_NAME"; then
       log_error "$(printf "Failed to create tar backup")"
-      rm -f $SQL_BACKUP_NAME
+      rm -f "$SQL_BACKUP_NAME"
       return 1
     fi
   fi
 
   # cleanup tmp folder
-  rm -f $SQL_BACKUP_NAME
+  rm -f "$SQL_BACKUP_NAME"
 
   # rm any backups older than BACKUP_DAYS (only if BACKUP_DAYS is a positive integer)
   case "$BACKUP_DAYS" in
@@ -234,10 +238,16 @@ make_backup() {
       log "BACKUP_DAYS is not set or not a positive integer; skipping old-backup pruning" "WARNING"
       ;;
     *)
-      find "$BACKUP_DIR" -type f -mtime +"$BACKUP_DAYS" -exec rm -f {} \;
+      # -name guards against deleting anything else the operator keeps here.
+      find "$BACKUP_DIR" -type f -name 'bw_backup_*' -mtime +"$BACKUP_DAYS" -exec rm -f {} \;
       ;;
   esac
 
+  # Returned via a named variable rather than stdout. log() writes INFO
+  # messages to stdout, and callers use RESULT=$(make_backup), so a single
+  # informational line added inside this function would be captured as part of
+  # the path and passed to rm and cp. It works today only by accident.
+  MAKE_BACKUP_RESULT=$BACKUP_FILE
   printf '%s' "$BACKUP_FILE"
   return 0
 }
@@ -362,6 +372,30 @@ restore_backup() {
     exit 1
   fi
   
+  # Decide whether this restore can proceed BEFORE doing any work.
+  #
+  # The emergency backup below opens the live database with sqlite3, which
+  # checkpoints and removes its -wal and -shm sidecars, and writes a new
+  # archive. Neither is destructive, but both mean a late abort is not the
+  # no-op the error message claims. Establishing the precondition first makes
+  # "nothing has been changed" literally true.
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    if [ "$RESTORE_FORCE" != "true" ]; then
+      log_error "This container cannot reach the Docker daemon, so it cannot confirm the vaultwarden container is stopped."
+      log_error "Restore overwrites /data/db.sqlite3 in place. Doing that while vaultwarden holds it open risks losing writes or corrupting the vault."
+      log_error "Nothing has been changed."
+      log_error ""
+      log_error "Stop the vault yourself and retry:"
+      log_error "    docker-compose stop bitwarden"
+      log_error "    docker exec -it backup backup restore $BACKUP_FILE"
+      log_error "    docker-compose start bitwarden"
+      log_error ""
+      log_error "If it is already stopped, set RESTORE_FORCE=true to proceed."
+      exit 1
+    fi
+    log "RESTORE_FORCE=true and the Docker daemon is unreachable: proceeding on the operator's assurance that the vault is stopped." "WARNING"
+  fi
+
   # Create backup using existing local backup function
   log "Creating backup of current state before restoration..."
 
@@ -410,7 +444,7 @@ restore_backup() {
     
     # Decrypt and extract
     log "$(printf "Decrypting backup file %s..." "$BACKUP_FILE")"
-    if ! openssl enc -d -aes256 -salt -pbkdf2 -pass pass:"${DECRYPT_KEY}" -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
+    if ! BW_KEY="$DECRYPT_KEY" openssl enc -d -aes256 -salt -pbkdf2 -pass env:BW_KEY -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
       log_error "Failed to decrypt or extract the backup file. Exiting"
       rm -rf "$RESTORE_TMP_DIR"
       exit 1
@@ -426,14 +460,32 @@ restore_backup() {
   fi
   
   
-  # Stop the bitwarden container before restoration
+  # Stop the bitwarden container before restoration.
+  #
+  # This must abort rather than warn. Restore overwrites /data/db.sqlite3 in
+  # place; doing that while vaultwarden holds the database open risks losing
+  # writes or corrupting it. Earlier versions logged a warning here and carried
+  # on, which meant removing the Docker socket from the container silently
+  # turned an interlock into a message nobody reads.
+  #
+  # RESTORE_FORCE=true overrides, for the case where the operator has already
+  # stopped the container by other means -- docker-compose stop on the host,
+  # for instance, which this container cannot observe without the socket.
   BITWARDEN_STOPPED=0
-  if command -v docker >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if stop_bitwarden; then
       BITWARDEN_STOPPED=1
+    elif [ "$RESTORE_FORCE" != "true" ]; then
+      # The daemon is reachable and still refused. That is a real failure, not
+      # a missing socket, so abort rather than overwrite a possibly live vault.
+      log_error "The Docker daemon is reachable but the vaultwarden container could not be stopped."
+      log_error "Abandoning the restore rather than overwriting a database that may still be open."
+      log_error "The emergency backup taken a moment ago is at: $EMERGENCY_BACKUP"
+      rm -rf "$RESTORE_TMP_DIR"
+      exit 1
+    else
+      log "RESTORE_FORCE=true: proceeding although the container could not be stopped." "WARNING"
     fi
-  else
-    log "Docker command not found. Cannot stop/start bitwarden container." "WARNING"
   fi
   
   # Create a timestamp for backup files
@@ -445,6 +497,18 @@ restore_backup() {
     if [ -f "/data/db.sqlite3" ]; then
       rm -f "/data/db.sqlite3"
     fi
+
+    # Remove the write-ahead log and shared-memory sidecars belonging to the
+    # database being replaced. Leaving them beside a restored file pairs a new
+    # database with another database's journal: SQLite may refuse to open it,
+    # or replay stale frames over the data just restored. The backup does not
+    # contain them and does not need to -- sqlite3 .backup produces a single
+    # consistent file.
+    for sidecar in /data/db.sqlite3-wal /data/db.sqlite3-shm /data/db.sqlite3-journal; do
+      if [ -e "$sidecar" ]; then
+        rm -f "$sidecar" && log "$(printf "Removed stale %s from the previous database" "$sidecar")"
+      fi
+    done
     
     # Restore the database
     cp "$RESTORE_TMP_DIR/db.sqlite3" "/data/db.sqlite3"

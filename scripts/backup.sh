@@ -4,6 +4,33 @@
 # Copyright (C) 2021 Bradford Law
 # Licensed under the terms of MIT
 
+# set -u is on: an unset variable is an error rather than an empty string. In a
+# script that builds rm and cp targets by interpolation, a typo silently
+# expanding to nothing is the failure mode worth catching. Every optional
+# setting is given an explicit default below, so absence stays a supported
+# state -- a deployment that uses neither rclone nor e-mail is normal.
+#
+# set -e is deliberately NOT set. "cmd || fallback" and functions returning
+# non-zero are used as ordinary control flow throughout, so enabling it would
+# change the meaning of existing code rather than catch bugs in it. The
+# destructive paths check their exit codes explicitly instead.
+set -u
+
+# Optional settings, defaulted so their absence is a documented state rather
+# than an accident of shell behaviour, and so a typo in a name fails visibly.
+: "${BACKUP_EMAIL_NOTIFY:=false}"
+: "${BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY:=false}"
+: "${BACKUP_EMAIL_TO:=}"
+: "${BACKUP_ENV:=false}"
+: "${BACKUP_DAYS:=}"
+: "${BACKUP_ENCRYPTION_KEY:=}"
+: "${BACKUP_RCLONE_CONF:=}"
+: "${BACKUP_RCLONE_DEST:=}"
+: "${RESTORE_FORCE:=false}"
+: "${BACKUP_MAX_AGE_DAYS:=8}"
+: "${CHECK_STATE_FILE:=/data/backups/.last-status-alert}"
+: "${METADATA_HOST:=metadata.google.internal}"
+
 LOG=/var/log/backup.log
 MUTTRC=/tmp/muttrc
 DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
@@ -69,7 +96,7 @@ log_error() {
 ###### E-mail Functions ######################################################################
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "$1" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
+if [ "${1:-}" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
   if [ "$SMTP_SECURITY" = "force_tls" ]; then
     MUTT_SSL_KEY=ssl_force_tls
     SMTP_PROTO=smtps
@@ -207,26 +234,41 @@ make_backup() {
   # tar up files and encrypt with openssl and encryption key
   BACKUP_DIR=/$DATA/backups
   mkdir -p "$BACKUP_DIR"
-  BACKUP_FILE=$BACKUP_DIR/"bw_backup_$(date "+%F-%H%M%S").tar.gz"
+  # Names are second-resolution, so two backups in the same second would
+  # collide. That is not hypothetical: restore_backup takes an emergency backup
+  # into this same directory, and a collision there overwrites the very archive
+  # being restored from -- the restore then silently reinstates the current
+  # database instead of the backup, and the backup is gone. Never overwrite.
+  BACKUP_BASE="bw_backup_$(date "+%F-%H%M%S")"
+  _suffix=0
+  while [ -e "$BACKUP_DIR/$BACKUP_BASE.tar.gz" ] || [ -e "$BACKUP_DIR/$BACKUP_BASE.tar.gz.aes256" ]; do
+    _suffix=$((_suffix + 1))
+    BACKUP_BASE="bw_backup_$(date "+%F-%H%M%S")-$_suffix"
+  done
+  BACKUP_FILE=$BACKUP_DIR/"$BACKUP_BASE.tar.gz"
 
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    if ! tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" | openssl enc -e -aes256 -salt -pbkdf2 -pass pass:${BACKUP_ENCRYPTION_KEY} -out $BACKUP_FILE; then
+    # -pass env: rather than pass:. Command-line arguments are readable from
+    # /proc/<pid>/cmdline by anything else in the container, and an unquoted
+    # expansion also breaks on a key containing spaces or shell metacharacters.
+    if ! BW_KEY="$BACKUP_ENCRYPTION_KEY" tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" \
+        | BW_KEY="$BACKUP_ENCRYPTION_KEY" openssl enc -e -aes256 -salt -pbkdf2 -pass env:BW_KEY -out "$BACKUP_FILE"; then
       log_error "$(printf "Failed to create encrypted backup")"
-      rm -f $SQL_BACKUP_NAME
+      rm -f "$SQL_BACKUP_NAME"
       return 1
     fi
   else
     if ! tar czf "$BACKUP_FILE" -C / $FILES -C $SQL_BACKUP_DIR "$SQL_NAME"; then
       log_error "$(printf "Failed to create tar backup")"
-      rm -f $SQL_BACKUP_NAME
+      rm -f "$SQL_BACKUP_NAME"
       return 1
     fi
   fi
 
   # cleanup tmp folder
-  rm -f $SQL_BACKUP_NAME
+  rm -f "$SQL_BACKUP_NAME"
 
   # rm any backups older than BACKUP_DAYS (only if BACKUP_DAYS is a positive integer)
   case "$BACKUP_DAYS" in
@@ -234,10 +276,16 @@ make_backup() {
       log "BACKUP_DAYS is not set or not a positive integer; skipping old-backup pruning" "WARNING"
       ;;
     *)
-      find "$BACKUP_DIR" -type f -mtime +"$BACKUP_DAYS" -exec rm -f {} \;
+      # -name guards against deleting anything else the operator keeps here.
+      find "$BACKUP_DIR" -type f -name 'bw_backup_*' -mtime +"$BACKUP_DAYS" -exec rm -f {} \;
       ;;
   esac
 
+  # Returned via a named variable rather than stdout. log() writes INFO
+  # messages to stdout, and callers use RESULT=$(make_backup), so a single
+  # informational line added inside this function would be captured as part of
+  # the path and passed to rm and cp. It works today only by accident.
+  MAKE_BACKUP_RESULT=$BACKUP_FILE
   printf '%s' "$BACKUP_FILE"
   return 0
 }
@@ -362,6 +410,30 @@ restore_backup() {
     exit 1
   fi
   
+  # Decide whether this restore can proceed BEFORE doing any work.
+  #
+  # The emergency backup below opens the live database with sqlite3, which
+  # checkpoints and removes its -wal and -shm sidecars, and writes a new
+  # archive. Neither is destructive, but both mean a late abort is not the
+  # no-op the error message claims. Establishing the precondition first makes
+  # "nothing has been changed" literally true.
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    if [ "$RESTORE_FORCE" != "true" ]; then
+      log_error "This container cannot reach the Docker daemon, so it cannot confirm the vaultwarden container is stopped."
+      log_error "Restore overwrites /data/db.sqlite3 in place. Doing that while vaultwarden holds it open risks losing writes or corrupting the vault."
+      log_error "Nothing has been changed."
+      log_error ""
+      log_error "Stop the vault yourself and retry:"
+      log_error "    docker-compose stop bitwarden"
+      log_error "    docker exec -it backup backup restore $BACKUP_FILE"
+      log_error "    docker-compose start bitwarden"
+      log_error ""
+      log_error "If it is already stopped, set RESTORE_FORCE=true to proceed."
+      exit 1
+    fi
+    log "RESTORE_FORCE=true and the Docker daemon is unreachable: proceeding on the operator's assurance that the vault is stopped." "WARNING"
+  fi
+
   # Create backup using existing local backup function
   log "Creating backup of current state before restoration..."
 
@@ -410,7 +482,7 @@ restore_backup() {
     
     # Decrypt and extract
     log "$(printf "Decrypting backup file %s..." "$BACKUP_FILE")"
-    if ! openssl enc -d -aes256 -salt -pbkdf2 -pass pass:"${DECRYPT_KEY}" -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
+    if ! BW_KEY="$DECRYPT_KEY" openssl enc -d -aes256 -salt -pbkdf2 -pass env:BW_KEY -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
       log_error "Failed to decrypt or extract the backup file. Exiting"
       rm -rf "$RESTORE_TMP_DIR"
       exit 1
@@ -426,14 +498,32 @@ restore_backup() {
   fi
   
   
-  # Stop the bitwarden container before restoration
+  # Stop the bitwarden container before restoration.
+  #
+  # This must abort rather than warn. Restore overwrites /data/db.sqlite3 in
+  # place; doing that while vaultwarden holds the database open risks losing
+  # writes or corrupting it. Earlier versions logged a warning here and carried
+  # on, which meant removing the Docker socket from the container silently
+  # turned an interlock into a message nobody reads.
+  #
+  # RESTORE_FORCE=true overrides, for the case where the operator has already
+  # stopped the container by other means -- docker-compose stop on the host,
+  # for instance, which this container cannot observe without the socket.
   BITWARDEN_STOPPED=0
-  if command -v docker >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if stop_bitwarden; then
       BITWARDEN_STOPPED=1
+    elif [ "$RESTORE_FORCE" != "true" ]; then
+      # The daemon is reachable and still refused. That is a real failure, not
+      # a missing socket, so abort rather than overwrite a possibly live vault.
+      log_error "The Docker daemon is reachable but the vaultwarden container could not be stopped."
+      log_error "Abandoning the restore rather than overwriting a database that may still be open."
+      log_error "The emergency backup taken a moment ago is at: $EMERGENCY_BACKUP"
+      rm -rf "$RESTORE_TMP_DIR"
+      exit 1
+    else
+      log "RESTORE_FORCE=true: proceeding although the container could not be stopped." "WARNING"
     fi
-  else
-    log "Docker command not found. Cannot stop/start bitwarden container." "WARNING"
   fi
   
   # Create a timestamp for backup files
@@ -445,6 +535,18 @@ restore_backup() {
     if [ -f "/data/db.sqlite3" ]; then
       rm -f "/data/db.sqlite3"
     fi
+
+    # Remove the write-ahead log and shared-memory sidecars belonging to the
+    # database being replaced. Leaving them beside a restored file pairs a new
+    # database with another database's journal: SQLite may refuse to open it,
+    # or replay stale frames over the data just restored. The backup does not
+    # contain them and does not need to -- sqlite3 .backup produces a single
+    # consistent file.
+    for sidecar in /data/db.sqlite3-wal /data/db.sqlite3-shm /data/db.sqlite3-journal; do
+      if [ -e "$sidecar" ]; then
+        rm -f "$sidecar" && log "$(printf "Removed stale %s from the previous database" "$sidecar")"
+      fi
+    done
     
     # Restore the database
     cp "$RESTORE_TMP_DIR/db.sqlite3" "/data/db.sqlite3"
@@ -554,28 +656,157 @@ restore_backup() {
 ###### Main Execution ########################################################################
 
 COMMAND_ERROR=0
-USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n")
+
+###### Status Checks #########################################################################
+
+# metadata
+# Args:
+#   $1 - path under computeMetadata/v1/
+# Behavior:
+#   Queries the GCE metadata server. Returns empty on any failure, including
+#   when running somewhere that is not GCE.
+metadata() {
+  # METADATA_HOST is overridable so tests can simulate running outside GCE.
+  curl -s -m 5 -H "Metadata-Flavor: Google" \
+    "http://${METADATA_HOST:-metadata.google.internal}/computeMetadata/v1/$1" 2>/dev/null
+}
+
+# cos_family_status
+# Args:
+#   $1 - milestone number
+# Behavior:
+#   Reports whether cos-<milestone>-lts still resolves. Google removes the
+#   family pointer at end of support, so a 404 is the end-of-life signal.
+#   Individual images are marked deprecated as newer builds supersede them
+#   inside a healthy family, which is why this asks about the family and not
+#   about an image.
+# Returns:
+#   Prints the HTTP status code.
+cos_family_status() {
+  _tok=$(metadata "instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  [ -n "$_tok" ] || { printf '000'; return 1; }
+  curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_tok" \
+    "https://compute.googleapis.com/compute/v1/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
+}
+
+# check_status
+# Behavior:
+#   Two checks that share one report: whether the host OS milestone is still
+#   supported, and whether a recent backup exists. Both are failures that are
+#   invisible by default -- an unsupported milestone stops receiving patches
+#   silently, and cron discards the output of a backup that never runs.
+#   Sends at most one e-mail per distinct problem, tracked in CHECK_STATE_FILE.
+# Returns:
+#   0 when everything is healthy, 1 when something needs attention.
+check_status() {
+  PROBLEMS=""
+  REPORT=""
+
+  # --- host OS milestone ---
+  IMAGE=$(metadata "instance/image")
+  MILESTONE=$(printf '%s' "$IMAGE" | sed -n 's/.*cos-\(stable-\)\?\([0-9][0-9]*\)-.*/\2/p')
+
+  if [ -z "$MILESTONE" ]; then
+    log "Not running on a GCE Container-Optimized OS instance, or metadata is unavailable; skipping the OS check."
+  else
+    CODE=$(cos_family_status "$MILESTONE")
+    case "$CODE" in
+      404)
+        PROBLEMS="$PROBLEMS os-eol"
+        REPORT="$REPORT$(printf 'Container-Optimized OS milestone %s is no longer supported.\n\nThe image family cos-%s-lts has been withdrawn, so this host receives no\nfurther security patches for the OS, the kernel, containerd or Docker, and\nthe in-milestone update timer will correctly find nothing forever.\n\nUpgrading means building a new instance:\n\n    ./utilities/upgrade-cos.sh --instance <name> --zone <zone>\n' "$MILESTONE" "$MILESTONE")
+
+"
+        ;;
+      200)
+        log "$(printf "Host OS milestone %s is still supported." "$MILESTONE")"
+        ;;
+      *)
+        log "$(printf "Could not determine support status for milestone %s (HTTP %s); skipping." "$MILESTONE" "$CODE")" "WARNING"
+        ;;
+    esac
+
+    # Look for newer LTS milestones. Steps of 4 match Google's numbering.
+    NEWER=""
+    _m=$((MILESTONE + 4))
+    _tries=0
+    while [ $_tries -lt 8 ]; do
+      [ "$(cos_family_status "$_m")" = "200" ] && NEWER="$_m"
+      _m=$((_m + 4))
+      _tries=$((_tries + 1))
+    done
+    if [ -n "$NEWER" ] && [ "$NEWER" != "$MILESTONE" ]; then
+      REPORT="$REPORT$(printf 'A newer LTS milestone is available: cos-%s-lts (currently on %s).\n' "$NEWER" "$MILESTONE")
+
+"
+      case "$PROBLEMS" in *os-eol*) ;; *) PROBLEMS="$PROBLEMS os-newer-$NEWER" ;; esac
+    fi
+  fi
+
+  # --- backup freshness ---
+  NEWEST=$(ls -t /data/backups/bw_backup_* 2>/dev/null | head -1)
+  if [ -z "$NEWEST" ]; then
+    PROBLEMS="$PROBLEMS no-backups"
+    REPORT="$REPORT$(printf 'There are no backups at all in /data/backups.\n\n')"
+  elif [ -n "$(find "$NEWEST" -mtime +"$BACKUP_MAX_AGE_DAYS" 2>/dev/null)" ]; then
+    PROBLEMS="$PROBLEMS stale-backup"
+    REPORT="$REPORT$(printf 'The newest backup is older than %s days.\n\n  %s\n\nScheduled backups appear to have stopped. cron discards script output, so\nthis fails silently: check "docker logs backup" and run a backup by hand:\n\n    docker exec backup ash /backup.sh %s\n\n' "$BACKUP_MAX_AGE_DAYS" "$NEWEST" "${BACKUP:-local}")"
+  else
+    log "$(printf "Newest backup is within %s days: %s" "$BACKUP_MAX_AGE_DAYS" "$(basename "$NEWEST")")"
+  fi
+
+  # --- report ---
+  if [ -z "$PROBLEMS" ]; then
+    log "Status check passed: OS milestone supported, backups current."
+    rm -f "$CHECK_STATE_FILE"
+    return 0
+  fi
+
+  printf '%s\n' "$REPORT" >&2
+
+  # Alert once per distinct set of problems, so a persistent condition does not
+  # mail every week until it is fixed.
+  LAST=$(cat "$CHECK_STATE_FILE" 2>/dev/null || true)
+  if [ "$LAST" = "$PROBLEMS" ]; then
+    log "Same problems as the last check; not sending another e-mail."
+  elif [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+    email_send "${SMTP_FROM_NAME:-Bitwarden} - action needed" "$REPORT"
+    printf '%s' "$PROBLEMS" > "$CHECK_STATE_FILE" 2>/dev/null || true
+    log "Alert sent."
+  else
+    log "BACKUP_EMAIL_NOTIFY is not true, so no e-mail was sent." "WARNING"
+  fi
+  return 1
+}
+
+USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>|check}\n")
 VALID="local email rclone"
 
-case "$1" in
+# ${1:-} throughout: with set -u a bare $1 is fatal when the script is
+# invoked with no arguments, which is exactly when it should print usage.
+case "${1:-}" in
+  check)
+    check_status
+    exit $?
+    ;;
   restore)
-    if [ -z "$2" ]; then
+    if [ -z "${2:-}" ]; then
       log_error "No backup file specified."
       printf '%b\n' "$USAGE" >&2
       exit 1
     fi
-    restore_backup "$2"
+    restore_backup "${2:-}"
     ;;
   *)
     # Check for extraneous arguments
-    if [ -n "$2" ]; then
-      log_error "Error: Unexpected argument '$2'. Only one backup method argument is allowed."
+    if [ -n "${2:-}" ]; then
+      log_error "Error: Unexpected argument '${2:-}'. Only one backup method argument is allowed."
       printf '%b\n' "$USAGE" >&2
       exit 1
     fi
     
     # validate backup methods - fail fast
-    METHODS=$(printf "%s" "$1" | tr ',' ' ')
+    METHODS=$(printf "%s" "${1:-}" | tr ',' ' ')
     for METHOD in $METHODS; do
       if ! echo $VALID | grep -q -w "$METHOD"; then
         ERROR=$(printf "Invalid backup method '%s'; backup failed\n" "$METHOD")

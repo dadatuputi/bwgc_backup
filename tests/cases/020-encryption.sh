@@ -1,6 +1,9 @@
 # The encrypted path must round-trip, and the key must not reach argv.
 reset_data
-export BACKUP_ENCRYPTION_KEY='p a s s"w0rd$with spaces'
+# A throwaway fixture, not a credential. Chosen to contain a space, a double
+# quote and a dollar sign, because the previous -pass pass:$VAR form was
+# unquoted and broke outright on exactly these characters.
+export BACKUP_ENCRYPTION_KEY='fixture-only p a s s"w0rd$with spaces'
 sh /backup.sh local >/dev/null 2>&1
 ARCHIVE=$(ls -t /data/backups/bw_backup_*.aes256 2>/dev/null | head -1)
 assert_file "$ARCHIVE" "encrypted archive written"

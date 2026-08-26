@@ -690,31 +690,6 @@ cos_family_status() {
     "https://compute.googleapis.com/compute/v1/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
 }
 
-# alpine_eol_date
-# Behavior:
-#   Prints the end-of-support date for the Alpine branch this image is built
-#   on, from Alpine's own releases.json. Empty if it cannot be determined.
-#
-#   The image pins a branch (alpine:3.24) rather than :latest, so upstream
-#   security patches still arrive automatically through the daily base-image
-#   rebuild, while a major version bump stays a deliberate act. The cost of
-#   that choice is that the branch eventually leaves support, and nothing would
-#   otherwise say so. This is that alarm.
-#
-#   No jq in this image, so both keys are extracted in document order and
-#   paired. eol_date follows rel_branch within each branch object.
-alpine_eol_date() {
-  _branch="v$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" | cut -d. -f1,2)"
-  [ "$_branch" != "v" ] || return 0
-  curl -s -m 20 "${ALPINE_RELEASES_URL:-https://alpinelinux.org/releases.json}" 2>/dev/null \
-    | tr ',' '\n' \
-    | grep -oE '"(rel_branch|eol_date)": *"[^"]*"' \
-    | grep -A1 "\"rel_branch\": *\"$_branch\"" \
-    | grep '"eol_date"' \
-    | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' \
-    | head -1
-}
-
 # check_status
 # Behavior:
 #   Two checks that share one report: whether the host OS milestone is still
@@ -765,26 +740,6 @@ check_status() {
 
 "
       case "$PROBLEMS" in *os-eol*) ;; *) PROBLEMS="$PROBLEMS os-newer-$NEWER" ;; esac
-    fi
-  fi
-
-  # --- Alpine branch support ---
-  AL_EOL=$(alpine_eol_date)
-  if [ -n "$AL_EOL" ]; then
-    TODAY=$(date +%F)
-    SOON=$(date -d "@$(( $(date +%s) + 15552000 ))" +%F 2>/dev/null || printf '%s' "$TODAY")
-    if [ "$AL_EOL" \< "$TODAY" ]; then
-      PROBLEMS="$PROBLEMS alpine-eol"
-      REPORT="$REPORT$(printf 'The Alpine branch this backup image is built on left support on %s.\n\nIt no longer receives security patches, so the daily base-image rebuild has\nnothing to pull. Bump the FROM line in the Dockerfile to a supported branch.\n' "$AL_EOL")
-
-"
-    elif [ "$AL_EOL" \< "$SOON" ]; then
-      PROBLEMS="$PROBLEMS alpine-eol-soon"
-      REPORT="$REPORT$(printf 'The Alpine branch this backup image is built on leaves support on %s,\nwithin the next six months. Plan a bump of the FROM line in the Dockerfile.\n' "$AL_EOL")
-
-"
-    else
-      log "$(printf "Alpine branch is supported until %s." "$AL_EOL")"
     fi
   fi
 

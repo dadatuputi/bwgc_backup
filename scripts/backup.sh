@@ -4,6 +4,27 @@
 # Copyright (C) 2021 Bradford Law
 # Licensed under the terms of MIT
 
+# Optional settings, defaulted so their absence is a documented state rather
+# than an accident of shell behaviour, and so a typo in a name fails visibly.
+#
+# This is also the prerequisite for enabling set -u later. set -u is NOT on
+# today: roughly two dozen settings are referenced bare and a deployment that
+# does not use rclone or e-mail leaves them unset on purpose, so turning it on
+# now would break those deployments rather than catch a bug. set -e is likewise
+# declined: "cmd || fallback" and functions returning non-zero are used as
+# ordinary control flow throughout, so it would change meaning, not add safety.
+: "${BACKUP_EMAIL_NOTIFY:=false}"
+: "${BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY:=false}"
+: "${BACKUP_EMAIL_TO:=}"
+: "${BACKUP_ENV:=false}"
+: "${BACKUP_DAYS:=}"
+: "${BACKUP_ENCRYPTION_KEY:=}"
+: "${BACKUP_RCLONE_CONF:=}"
+: "${BACKUP_RCLONE_DEST:=}"
+: "${RESTORE_FORCE:=false}"
+: "${BACKUP_MAX_AGE_DAYS:=8}"
+: "${CHECK_STATE_FILE:=/data/backups/.last-status-alert}"
+
 LOG=/var/log/backup.log
 MUTTRC=/tmp/muttrc
 DOCKER_API_VERSION=${DOCKER_API_VERSION:-1.43}
@@ -618,10 +639,136 @@ restore_backup() {
 ###### Main Execution ########################################################################
 
 COMMAND_ERROR=0
-USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>}\n")
+
+###### Status Checks #########################################################################
+
+# metadata
+# Args:
+#   $1 - path under computeMetadata/v1/
+# Behavior:
+#   Queries the GCE metadata server. Returns empty on any failure, including
+#   when running somewhere that is not GCE.
+metadata() {
+  curl -s -m 5 -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
+}
+
+# cos_family_status
+# Args:
+#   $1 - milestone number
+# Behavior:
+#   Reports whether cos-<milestone>-lts still resolves. Google removes the
+#   family pointer at end of support, so a 404 is the end-of-life signal.
+#   Individual images are marked deprecated as newer builds supersede them
+#   inside a healthy family, which is why this asks about the family and not
+#   about an image.
+# Returns:
+#   Prints the HTTP status code.
+cos_family_status() {
+  _tok=$(metadata "instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  [ -n "$_tok" ] || { printf '000'; return 1; }
+  curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_tok" \
+    "https://compute.googleapis.com/compute/v1/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
+}
+
+# check_status
+# Behavior:
+#   Two checks that share one report: whether the host OS milestone is still
+#   supported, and whether a recent backup exists. Both are failures that are
+#   invisible by default -- an unsupported milestone stops receiving patches
+#   silently, and cron discards the output of a backup that never runs.
+#   Sends at most one e-mail per distinct problem, tracked in CHECK_STATE_FILE.
+# Returns:
+#   0 when everything is healthy, 1 when something needs attention.
+check_status() {
+  PROBLEMS=""
+  REPORT=""
+
+  # --- host OS milestone ---
+  IMAGE=$(metadata "instance/image")
+  MILESTONE=$(printf '%s' "$IMAGE" | sed -n 's/.*cos-\(stable-\)\?\([0-9][0-9]*\)-.*/\2/p')
+
+  if [ -z "$MILESTONE" ]; then
+    log "Not running on a GCE Container-Optimized OS instance, or metadata is unavailable; skipping the OS check."
+  else
+    CODE=$(cos_family_status "$MILESTONE")
+    case "$CODE" in
+      404)
+        PROBLEMS="$PROBLEMS os-eol"
+        REPORT="$REPORT$(printf 'Container-Optimized OS milestone %s is no longer supported.\n\nThe image family cos-%s-lts has been withdrawn, so this host receives no\nfurther security patches for the OS, the kernel, containerd or Docker, and\nthe in-milestone update timer will correctly find nothing forever.\n\nUpgrading means building a new instance:\n\n    ./utilities/upgrade-cos.sh --instance <name> --zone <zone>\n' "$MILESTONE" "$MILESTONE")
+
+"
+        ;;
+      200)
+        log "$(printf "Host OS milestone %s is still supported." "$MILESTONE")"
+        ;;
+      *)
+        log "$(printf "Could not determine support status for milestone %s (HTTP %s); skipping." "$MILESTONE" "$CODE")" "WARNING"
+        ;;
+    esac
+
+    # Look for newer LTS milestones. Steps of 4 match Google's numbering.
+    NEWER=""
+    _m=$((MILESTONE + 4))
+    _tries=0
+    while [ $_tries -lt 8 ]; do
+      [ "$(cos_family_status "$_m")" = "200" ] && NEWER="$_m"
+      _m=$((_m + 4))
+      _tries=$((_tries + 1))
+    done
+    if [ -n "$NEWER" ] && [ "$NEWER" != "$MILESTONE" ]; then
+      REPORT="$REPORT$(printf 'A newer LTS milestone is available: cos-%s-lts (currently on %s).\n' "$NEWER" "$MILESTONE")
+
+"
+      case "$PROBLEMS" in *os-eol*) ;; *) PROBLEMS="$PROBLEMS os-newer-$NEWER" ;; esac
+    fi
+  fi
+
+  # --- backup freshness ---
+  NEWEST=$(ls -t /data/backups/bw_backup_* 2>/dev/null | head -1)
+  if [ -z "$NEWEST" ]; then
+    PROBLEMS="$PROBLEMS no-backups"
+    REPORT="$REPORT$(printf 'There are no backups at all in /data/backups.\n\n')"
+  elif [ -n "$(find "$NEWEST" -mtime +"$BACKUP_MAX_AGE_DAYS" 2>/dev/null)" ]; then
+    PROBLEMS="$PROBLEMS stale-backup"
+    REPORT="$REPORT$(printf 'The newest backup is older than %s days.\n\n  %s\n\nScheduled backups appear to have stopped. cron discards script output, so\nthis fails silently: check "docker logs backup" and run a backup by hand:\n\n    docker exec backup ash /backup.sh %s\n\n' "$BACKUP_MAX_AGE_DAYS" "$NEWEST" "${BACKUP:-local}")"
+  else
+    log "$(printf "Newest backup is within %s days: %s" "$BACKUP_MAX_AGE_DAYS" "$(basename "$NEWEST")")"
+  fi
+
+  # --- report ---
+  if [ -z "$PROBLEMS" ]; then
+    log "Status check passed: OS milestone supported, backups current."
+    rm -f "$CHECK_STATE_FILE"
+    return 0
+  fi
+
+  printf '%s\n' "$REPORT" >&2
+
+  # Alert once per distinct set of problems, so a persistent condition does not
+  # mail every week until it is fixed.
+  LAST=$(cat "$CHECK_STATE_FILE" 2>/dev/null || true)
+  if [ "$LAST" = "$PROBLEMS" ]; then
+    log "Same problems as the last check; not sending another e-mail."
+  elif [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
+    email_send "${SMTP_FROM_NAME:-Bitwarden} - action needed" "$REPORT"
+    printf '%s' "$PROBLEMS" > "$CHECK_STATE_FILE" 2>/dev/null || true
+    log "Alert sent."
+  else
+    log "BACKUP_EMAIL_NOTIFY is not true, so no e-mail was sent." "WARNING"
+  fi
+  return 1
+}
+
+USAGE=$(printf "Usage: $0 {local,email,rclone|restore <backup_file>|check}\n")
 VALID="local email rclone"
 
 case "$1" in
+  check)
+    check_status
+    exit $?
+    ;;
   restore)
     if [ -z "$2" ]; then
       log_error "No backup file specified."

@@ -2,17 +2,9 @@
 # a base image bump is a reviewable change. Renovate updates this line.
 FROM alpine:3.24
 
-# rclone now comes from the Alpine community repository. The previous approach
-# downloaded rclone-current-linux-amd64.zip over curl and unzipped it with no
-# checksum and no signature, which verified nothing and installed a different
-# version on every build. apk verifies package signatures against Alpine's
-# trusted keys.
-#
-# Trade-off worth stating: Alpine's rclone can lag upstream. If a newer release
-# is ever required, pin the exact version and verify its published SHA256
-# rather than returning to an unverified "current" download.
-#
-# --no-cache already fetches a fresh index, so --update was redundant.
+# rclone comes from the Alpine community repository so apk verifies its
+# signature. Alpine's build can lag upstream; if a newer release is needed, pin
+# the version and verify its published SHA256.
 RUN apk add --no-cache \
       docker-cli \
       curl \

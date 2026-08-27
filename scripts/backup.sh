@@ -4,20 +4,15 @@
 # Copyright (C) 2021 Bradford Law
 # Licensed under the terms of MIT
 
-# set -u is on: an unset variable is an error rather than an empty string. In a
-# script that builds rm and cp targets by interpolation, a typo silently
-# expanding to nothing is the failure mode worth catching. Every optional
-# setting is given an explicit default below, so absence stays a supported
-# state -- a deployment that uses neither rclone nor e-mail is normal.
+# set -u catches a typo'd variable expanding to nothing in an rm or cp target.
+# Optional settings are defaulted below so their absence stays supported.
 #
-# set -e is deliberately NOT set. "cmd || fallback" and functions returning
-# non-zero are used as ordinary control flow throughout, so enabling it would
-# change the meaning of existing code rather than catch bugs in it. The
-# destructive paths check their exit codes explicitly instead.
+# set -e is intentionally off: "cmd || fallback" and functions returning
+# non-zero are ordinary control flow here. Destructive paths check exit codes
+# explicitly.
 set -u
 
-# Optional settings, defaulted so their absence is a documented state rather
-# than an accident of shell behaviour, and so a typo in a name fails visibly.
+# Optional settings.
 : "${BACKUP_EMAIL_NOTIFY:=false}"
 : "${BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY:=false}"
 : "${BACKUP_EMAIL_TO:=}"
@@ -234,11 +229,9 @@ make_backup() {
   # tar up files and encrypt with openssl and encryption key
   BACKUP_DIR=/$DATA/backups
   mkdir -p "$BACKUP_DIR"
-  # Names are second-resolution, so two backups in the same second would
-  # collide. That is not hypothetical: restore_backup takes an emergency backup
-  # into this same directory, and a collision there overwrites the very archive
-  # being restored from -- the restore then silently reinstates the current
-  # database instead of the backup, and the backup is gone. Never overwrite.
+  # Names are second-resolution, and restore_backup writes an emergency backup
+  # into this directory before restoring, so a collision would overwrite the
+  # archive being restored from. Never overwrite.
   BACKUP_BASE="bw_backup_$(date "+%F-%H%M%S")"
   _suffix=0
   while [ -e "$BACKUP_DIR/$BACKUP_BASE.tar.gz" ] || [ -e "$BACKUP_DIR/$BACKUP_BASE.tar.gz.aes256" ]; do
@@ -250,9 +243,9 @@ make_backup() {
   # If a password is provided, run it through openssl
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
     BACKUP_FILE=$BACKUP_FILE.aes256
-    # -pass env: rather than pass:. Command-line arguments are readable from
-    # /proc/<pid>/cmdline by anything else in the container, and an unquoted
-    # expansion also breaks on a key containing spaces or shell metacharacters.
+    # -pass env: keeps the key out of argv, which is readable from
+    # /proc/<pid>/cmdline, and out of an expansion that would break on a key
+    # containing spaces or shell metacharacters.
     if ! BW_KEY="$BACKUP_ENCRYPTION_KEY" tar czf - -C / $FILES -C "$SQL_BACKUP_DIR" "$SQL_NAME" \
         | BW_KEY="$BACKUP_ENCRYPTION_KEY" openssl enc -e -aes256 -salt -pbkdf2 -pass env:BW_KEY -out "$BACKUP_FILE"; then
       log_error "$(printf "Failed to create encrypted backup")"
@@ -281,10 +274,9 @@ make_backup() {
       ;;
   esac
 
-  # Returned via a named variable rather than stdout. log() writes INFO
-  # messages to stdout, and callers use RESULT=$(make_backup), so a single
-  # informational line added inside this function would be captured as part of
-  # the path and passed to rm and cp. It works today only by accident.
+  # Also returned in a named variable. Callers use RESULT=$(make_backup), and
+  # log() writes INFO to stdout, so anything logged here would be captured as
+  # part of the path and passed to rm and cp.
   MAKE_BACKUP_RESULT=$BACKUP_FILE
   printf '%s' "$BACKUP_FILE"
   return 0
@@ -410,13 +402,9 @@ restore_backup() {
     exit 1
   fi
   
-  # Decide whether this restore can proceed BEFORE doing any work.
-  #
-  # The emergency backup below opens the live database with sqlite3, which
-  # checkpoints and removes its -wal and -shm sidecars, and writes a new
-  # archive. Neither is destructive, but both mean a late abort is not the
-  # no-op the error message claims. Establishing the precondition first makes
-  # "nothing has been changed" literally true.
+  # Establish the precondition before doing any work, so an abort here changes
+  # nothing. The emergency backup below opens the live database with sqlite3,
+  # which checkpoints away its -wal and -shm sidecars, and writes an archive.
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     if [ "$RESTORE_FORCE" != "true" ]; then
       log_error "This container cannot reach the Docker daemon, so it cannot confirm the vaultwarden container is stopped."
@@ -498,17 +486,12 @@ restore_backup() {
   fi
   
   
-  # Stop the bitwarden container before restoration.
+  # Stop the vault before restoring. Restore overwrites /data/db.sqlite3 in
+  # place, and doing that while vaultwarden holds it open risks losing writes or
+  # corrupting the database, so failure to stop it aborts.
   #
-  # This must abort rather than warn. Restore overwrites /data/db.sqlite3 in
-  # place; doing that while vaultwarden holds the database open risks losing
-  # writes or corrupting it. Earlier versions logged a warning here and carried
-  # on, which meant removing the Docker socket from the container silently
-  # turned an interlock into a message nobody reads.
-  #
-  # RESTORE_FORCE=true overrides, for the case where the operator has already
-  # stopped the container by other means -- docker-compose stop on the host,
-  # for instance, which this container cannot observe without the socket.
+  # RESTORE_FORCE=true covers the operator having stopped it from the host,
+  # which this container cannot observe without the Docker socket.
   BITWARDEN_STOPPED=0
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if stop_bitwarden; then
@@ -536,12 +519,10 @@ restore_backup() {
       rm -f "/data/db.sqlite3"
     fi
 
-    # Remove the write-ahead log and shared-memory sidecars belonging to the
-    # database being replaced. Leaving them beside a restored file pairs a new
-    # database with another database's journal: SQLite may refuse to open it,
-    # or replay stale frames over the data just restored. The backup does not
-    # contain them and does not need to -- sqlite3 .backup produces a single
-    # consistent file.
+    # Remove the sidecars belonging to the database being replaced. They pair a
+    # restored database with another database's journal, which SQLite may refuse
+    # to open or may use to replay stale frames over it. The archive holds none:
+    # sqlite3 .backup produces a single consistent file.
     for sidecar in /data/db.sqlite3-wal /data/db.sqlite3-shm /data/db.sqlite3-journal; do
       if [ -e "$sidecar" ]; then
         rm -f "$sidecar" && log "$(printf "Removed stale %s from the previous database" "$sidecar")"

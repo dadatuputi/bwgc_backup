@@ -120,7 +120,9 @@ fi
 email_send() {
   SUBJECT=$1
   BODY=$2
-  ATTACHMENT=$3
+  # Optional: the failure and status mails pass no attachment, and a bare $3
+  # would stop the script under set -u before anything is sent.
+  ATTACHMENT=${3:-}
 
   if [ -n "$ATTACHMENT" ]; then
     ATTACHMENT="-a $ATTACHMENT --"

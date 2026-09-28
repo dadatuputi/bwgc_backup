@@ -369,13 +369,16 @@ backup(){
         # archives in one run. With rclone's default of four, that can exceed
         # a container memory limit and get rclone killed. The archives are
         # small, so sending them in turn costs next to nothing.
-        REMOTES=$(rclone --config "$BACKUP_RCLONE_CONF" listremotes | tr '\n' ' ')
         PUSH_TOTAL_CNT=0
         PUSH_FAILED_CNT=0
         PUSH_ERROR_LOG=""
 
-        for REMOTE in $REMOTES
+        # One remote per line. rclone allows spaces in a remote name, so the
+        # list cannot be word-split. The here-document keeps the loop in this
+        # shell; a pipe would run it in a subshell and lose the counters.
+        while IFS= read -r REMOTE
         do
+          [ -n "$REMOTE" ] || continue
           PUSH_TOTAL_CNT=$(($PUSH_TOTAL_CNT + 1))
           DEST="$REMOTE$BACKUP_RCLONE_DEST"
           if ! PUSH_LOG_ITEM="$(rclone --config "$BACKUP_RCLONE_CONF" copy --transfers 1 --include 'bw_backup_*' "$BACKUP_DIR" "$DEST" 2>&1)"; then
@@ -388,7 +391,9 @@ backup(){
           if ! PRUNE_ERROR=$(rclone_prune "$DEST"); then
             log "$PRUNE_ERROR" "WARNING"
           fi
-        done
+        done <<EOF
+$(rclone --config "$BACKUP_RCLONE_CONF" listremotes)
+EOF
 
         if [ $PUSH_FAILED_CNT -ne 0 ]; then
           printf "Failed to copy to ${PUSH_FAILED_CNT} of ${PUSH_TOTAL_CNT} remotes:\n  %b" "$PUSH_ERROR_LOG"

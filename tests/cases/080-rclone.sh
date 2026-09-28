@@ -78,3 +78,18 @@ printf 'not a directory\n' > /tmp/remote-file
 BACKUP_RCLONE_CONF="$RC" BACKUP_RCLONE_DEST=/tmp/remote-file/sub sh /backup.sh rclone >/dev/null 2>&1
 assert_status $? 1 "a failed copy fails the backup"
 rm -f /tmp/remote-file
+
+# rclone allows spaces in a remote name, and listremotes prints one name per
+# line. Each remote must be pushed to as a whole, not as its words.
+SP_CONF=/tmp/rclone-space.conf
+SP_DIR=/tmp/remote-space
+printf '[bk]\ntype = local\n\n[my remote]\ntype = local\n' > "$SP_CONF"
+reset_data
+reset_remote
+rm -rf "$SP_DIR"
+mkdir -p "$SP_DIR"
+sp_out=$(BACKUP_RCLONE_CONF="$SP_CONF" BACKUP_RCLONE_DEST="$SP_DIR" sh /backup.sh rclone 2>&1)
+assert_status $? 0 "a remote whose name has a space is pushed to"
+assert_eq "$(ls "$SP_DIR" | grep -c '^bw_backup_')" 1 "the archive reaches the remote with a space in its name"
+assert_not_contains "$sp_out" "Failed to copy" "no remote is split into its words"
+rm -rf "$SP_DIR" "$SP_CONF"

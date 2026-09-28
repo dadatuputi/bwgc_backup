@@ -18,6 +18,7 @@ set -u
 : "${BACKUP_EMAIL_TO:=}"
 : "${BACKUP_ENV:=false}"
 : "${BACKUP_DAYS:=}"
+: "${BACKUP_DIR:=/data/backups}"
 : "${BACKUP_ENCRYPTION_KEY:=}"
 : "${BACKUP_RCLONE_CONF:=}"
 : "${BACKUP_RCLONE_DEST:=}"
@@ -191,6 +192,36 @@ rclone_init() {
   log "$(printf "Rclone installed to %b" "$RCLONE")"
 }
 
+# rclone_prune
+# Args:
+#   $1 - DEST: rclone destination (remote:path) the archives were just copied to
+# Behavior:
+#   Deletes bw_backup_* archives older than BACKUP_DAYS from DEST, the rule
+#   applied to the local directory, and leaves every other file alone. With
+#   BACKUP_DAYS unset, deletes nothing.
+# Returns:
+#   0 on success or when there is nothing to prune; non-zero on failure, with
+#   the reason printed to stdout.
+rclone_prune() {
+  DEST=$1
+
+  case "$BACKUP_DAYS" in
+    ''|*[!0-9]*)
+      # Nothing to go by. make_backup has already warned about BACKUP_DAYS.
+      return 0
+      ;;
+  esac
+  # find -mtime +N, used on the local directory, matches files at least N+1
+  # days old. --min-age takes the same cutoff, so the remote keeps the same
+  # archives as the local directory and the copy never sends back one the
+  # prune has removed.
+  if ! PRUNE_OUT=$(rclone --config "$BACKUP_RCLONE_CONF" delete --include 'bw_backup_*' --min-age "$((BACKUP_DAYS + 1))d" "$DEST" 2>&1); then
+    printf "Could not prune %s:\n  %s" "$DEST" "$PRUNE_OUT"
+    return 1
+  fi
+  return 0
+}
+
 # make_backup
 # Create backup and prune old backups
 # Borrowed heavily from https://github.com/shivpatel/bitwarden_rs-local-backup
@@ -324,23 +355,43 @@ backup(){
 
       # Only run if $BACKUP_RCLONE_CONF has been setup
       if [ -s "$BACKUP_RCLONE_CONF" ]; then
-        # Sync with rclone
-        REMOTES=$(rclone --config $BACKUP_RCLONE_CONF listremotes | tr '\n' ' ')
-        SYNC_TOTAL_CNT=0
-        SYNC_FAILED_CNT=0
-        
+        # copy, not sync. sync made each remote an exact mirror of the local
+        # directory, so a local directory that was lost or emptied (a rebuilt
+        # disk, a move that left the archives behind) deleted every archive on
+        # the remote at the next run. copy only adds files. Old archives are
+        # removed by rclone_prune, and only after the copy has succeeded.
+        #
+        # Only archives are copied. The directory also holds the status
+        # check's state file.
+        #
+        # One file at a time: each transfer holds its own upload buffer (48 MiB
+        # on Dropbox), and a remote that missed several nights gets all their
+        # archives in one run. With rclone's default of four, that can exceed
+        # a container memory limit and get rclone killed. The archives are
+        # small, so sending them in turn costs next to nothing.
+        REMOTES=$(rclone --config "$BACKUP_RCLONE_CONF" listremotes | tr '\n' ' ')
+        PUSH_TOTAL_CNT=0
+        PUSH_FAILED_CNT=0
+        PUSH_ERROR_LOG=""
+
         for REMOTE in $REMOTES
         do
-          SYNC_TOTAL_CNT=$(($SYNC_TOTAL_CNT + 1))
-          SYNC_LOG_ITEM="$(rclone --config $BACKUP_RCLONE_CONF sync $BACKUP_DIR "$REMOTE$BACKUP_RCLONE_DEST" 2>&1)"
-          if [ $? -ne 0 ]; then
-            SYNC_ERROR_LOG="${SYNC_ERROR_LOG}Sync log with ${REMOTE}\n==========\n${SYNC_LOG_ITEM}\n==========\n\n"
-            SYNC_FAILED_CNT=$(($SYNC_FAILED_CNT + 1))
+          PUSH_TOTAL_CNT=$(($PUSH_TOTAL_CNT + 1))
+          DEST="$REMOTE$BACKUP_RCLONE_DEST"
+          if ! PUSH_LOG_ITEM="$(rclone --config "$BACKUP_RCLONE_CONF" copy --transfers 1 --include 'bw_backup_*' "$BACKUP_DIR" "$DEST" 2>&1)"; then
+            PUSH_ERROR_LOG="${PUSH_ERROR_LOG}Copy log with ${REMOTE}\n==========\n${PUSH_LOG_ITEM}\n==========\n\n"
+            PUSH_FAILED_CNT=$(($PUSH_FAILED_CNT + 1))
+            continue
+          fi
+          # The archive is on the remote by now, so a failed prune is reported
+          # but does not fail the backup.
+          if ! PRUNE_ERROR=$(rclone_prune "$DEST"); then
+            log "$PRUNE_ERROR" "WARNING"
           fi
         done
 
-        if [ $SYNC_FAILED_CNT -ne 0 ]; then
-          printf "Failed to sync on ${SYNC_FAILED_CNT} of ${SYNC_TOTAL_CNT} remotes:\n  %b" "$SYNC_ERROR_LOG"
+        if [ $PUSH_FAILED_CNT -ne 0 ]; then
+          printf "Failed to copy to ${PUSH_FAILED_CNT} of ${PUSH_TOTAL_CNT} remotes:\n  %b" "$PUSH_ERROR_LOG"
           return 1
         fi
       else

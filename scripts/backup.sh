@@ -26,6 +26,9 @@ set -u
 : "${BACKUP_MAX_AGE_DAYS:=8}"
 : "${CHECK_STATE_FILE:=/data/backups/.last-status-alert}"
 : "${METADATA_HOST:=metadata.google.internal}"
+# Every mail subject starts with this. Unset, it would stop the script under
+# set -u at the moment a failure is being reported.
+: "${SMTP_FROM_NAME:=Bitwarden}"
 
 LOG=/var/log/backup.log
 MUTTRC=/tmp/muttrc
@@ -910,8 +913,11 @@ case "${1:-}" in
 
     if [ -n "$SUCCESSFUL_BACKUPS" ]; then
       if [ "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ "$BACKUP_EMAIL_NOTIFY_ON_FAILURE_ONLY" != "true" ]; then
-        BODY="Backup completed successfully via: $SUCCESSFUL_BACKUPS"
-        email_send "$SMTP_FROM_NAME - Backup Successful" "$BODY" "$RESULT"
+        # A notice, not a delivery: the archive is not attached. The email
+        # method has already sent it, with restore instructions, and the
+        # other methods put it where they were asked to.
+        BODY="Backup completed successfully via: $SUCCESSFUL_BACKUPS\n\nArchive: $RESULT"
+        email_send "$SMTP_FROM_NAME - Backup Successful" "$BODY"
       fi
     else
       log_error "All backup methods failed."

@@ -93,18 +93,35 @@ log_error() {
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
 if [ "${1:-}" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
-  if [ "$SMTP_SECURITY" = "force_tls" ]; then
-    MUTT_SSL_KEY=ssl_force_tls
-    SMTP_PROTO=smtps
+  # SMTP_SECURITY takes vaultwarden's values. Mutt 2 requires TLS unless told
+  # otherwise (ssl_force_tls is on by default), so every mode sets it: "off"
+  # could not send at all, and "starttls" must not depend on that default to
+  # refuse a server whose STARTTLS was stripped on the way.
+  case "${SMTP_SECURITY:-}" in
+    force_tls)
+      SMTP_PROTO=smtps
+      MUTT_TLS="set ssl_force_tls=yes" ;;
+    off)
+      SMTP_PROTO=smtp
+      MUTT_TLS="set ssl_force_tls=no
+set ssl_starttls=no" ;;
+    *)
+      SMTP_PROTO=smtp
+      MUTT_TLS="set ssl_force_tls=yes
+set ssl_starttls=yes" ;;
+  esac
+  # A server that takes mail without authentication, such as a local relay,
+  # gets no user and no password rather than an empty login.
+  if [ -n "${SMTP_USERNAME:-}" ]; then
+    SMTP_URL="${SMTP_PROTO}://${SMTP_USERNAME}@${SMTP_HOST}:${SMTP_PORT}"
   else
-    MUTT_SSL_KEY=ssl_starttls
-    SMTP_PROTO=smtp
+    SMTP_URL="${SMTP_PROTO}://${SMTP_HOST}:${SMTP_PORT}"
   fi
-  cat >"$MUTTRC" <<EOF
-set ${MUTT_SSL_KEY}=yes
-set smtp_url="${SMTP_PROTO}://${SMTP_USERNAME}@${SMTP_HOST}:${SMTP_PORT}"
-set smtp_pass="${SMTP_PASSWORD}"
-EOF
+  {
+    printf '%s\n' "$MUTT_TLS"
+    printf 'set smtp_url="%s"\n' "$SMTP_URL"
+    [ -z "${SMTP_USERNAME:-}" ] || printf 'set smtp_pass="%s"\n' "${SMTP_PASSWORD:-}"
+  } >"$MUTTRC"
   log "Finished configuring email."
 fi
 

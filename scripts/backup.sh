@@ -1,4 +1,5 @@
 #!/usr/bin/env ash
+# shellcheck shell=dash
 
 # vaultwarden backup script for docker
 # Copyright (C) 2021 Bradford Law
@@ -42,7 +43,6 @@ export DOCKER_API_VERSION
 # SMTP_SECURITY=
 # SMTP_USERNAME=
 # SMTP_PASSWORD
-AUTH_METHOD=LOGIN
 
 # Backup settings - provided as environment variables but may be set below:
 # SMTP_FROM_NAME=
@@ -95,7 +95,7 @@ log_error() {
 ###### E-mail Functions ######################################################################
 
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
-if [ "${1:-}" = "email" -o "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ ! -f "$MUTTRC" ]; then
+if { [ "${1:-}" = "email" ] || [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; } && [ ! -f "$MUTTRC" ]; then
   # SMTP_SECURITY takes vaultwarden's values. Mutt 2 requires TLS unless told
   # otherwise (ssl_force_tls is on by default), so every mode sets it: "off"
   # could not send at all, and "starttls" must not depend on that default to
@@ -204,7 +204,7 @@ rclone_init() {
   # rclone install now handled in Dockerfile, so this function should never be executed
   curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
   unzip rclone-current-linux-amd64.zip
-  cd rclone-*-linux-amd64
+  cd rclone-*-linux-amd64 || return 1
   cp rclone /usr/bin/
   chown root:root $RCLONE
   chmod 755 $RCLONE
@@ -275,7 +275,7 @@ make_backup() {
   FILES="$FILES $([ -d "$DATA/attachments" ] && echo $DATA/attachments)"
   FILES="$FILES $([ -d "$DATA/sends" ] && echo $DATA/sends)"
   FILES="$FILES $([ -r "$DATA/config.json" ] && echo $DATA/config.json)"
-  FILES="$FILES $([ -r "$DATA/rsa_key.der" -o -r "$DATA/rsa_key.pem" -o -r "$DATA/rsa_key.pub.der" ] && echo $DATA/rsa_key*)"
+  FILES="$FILES $({ [ -r "$DATA/rsa_key.der" ] || [ -r "$DATA/rsa_key.pem" ] || [ -r "$DATA/rsa_key.pub.der" ]; } && echo $DATA/rsa_key*)"
 
   FILES="$FILES $([ -r .env ] && [ "$BACKUP_ENV" = "true" ] && echo .env)"
 
@@ -327,10 +327,9 @@ make_backup() {
       ;;
   esac
 
-  # Also returned in a named variable. Callers use RESULT=$(make_backup), and
-  # log() writes INFO to stdout, so anything logged here would be captured as
-  # part of the path and passed to rm and cp.
-  MAKE_BACKUP_RESULT=$BACKUP_FILE
+  # Callers use RESULT=$(make_backup), and log() writes INFO to stdout, so
+  # anything logged here would be captured as part of the path and passed to
+  # rm and cp.
   printf '%s' "$BACKUP_FILE"
   return 0
 }
@@ -369,7 +368,7 @@ backup(){
 
     rclone)
       # Initialize rclone if BACKUP=rclone and $(command -v rclone) is blank
-      if [ "$METHOD" = "rclone" -a -z "$(command -v rclone)" ]; then
+      if [ "$METHOD" = "rclone" ] && [ -z "$(command -v rclone)" ]; then
         rclone_init
       fi
 
@@ -587,9 +586,6 @@ restore_backup() {
     fi
   fi
   
-  # Create a timestamp for backup files
-  TIMESTAMP=$(date "+%F-%H%M%S")
-  
   # Restore the SQLite database
   if [ -f "$RESTORE_TMP_DIR/db.sqlite3" ]; then
     log "Restoring database..."
@@ -713,8 +709,6 @@ restore_backup() {
 }
 
 ###### Main Execution ########################################################################
-
-COMMAND_ERROR=0
 
 ###### Status Checks #########################################################################
 

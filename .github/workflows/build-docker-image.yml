@@ -54,6 +54,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Static analysis before anything is built. The image ships no
+      # shellcheck, so the suite cannot run it; the runner has it.
+      - name: Shellcheck the scripts
+        run: |
+          shellcheck --version | sed -n 2p
+          shellcheck -S warning scripts/*.sh
+
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
       - name: Extract Docker metadata

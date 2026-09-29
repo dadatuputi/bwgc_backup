@@ -14,7 +14,7 @@
 # which restore must refuse to run.
 
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 FILTER="${1:-}"
 
 if [ -n "${BWGC_IMAGE:-}" ]; then
@@ -26,8 +26,15 @@ else
 	docker build -q -t "$IMAGE" "$ROOT" >/dev/null
 fi
 
+# BWGC_SMTP_HOST, BWGC_SMTP_PORT and BWGC_MAILPIT_API point the delivery case
+# at a mailpit server; unset, that case skips. host.docker.internal lets a
+# server on this host be named from inside the container.
 docker run --rm \
 	-e FILTER="$FILTER" \
+	-e BWGC_SMTP_HOST="${BWGC_SMTP_HOST:-}" \
+	-e BWGC_SMTP_PORT="${BWGC_SMTP_PORT:-}" \
+	-e BWGC_MAILPIT_API="${BWGC_MAILPIT_API:-}" \
+	--add-host=host.docker.internal:host-gateway \
 	-v "$ROOT/tests:/tests:ro" \
 	-v "$ROOT/scripts/backup.sh:/backup.sh:ro" \
 	-v "$ROOT/scripts/backup_init.sh:/backup_init.sh:ro" \

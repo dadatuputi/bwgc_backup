@@ -31,6 +31,20 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A real SMTP server for the delivery case in the test suite. It takes any
+    # login, so the authenticated path is exercised too, and offers no TLS,
+    # so a starttls configuration must refuse it. Its ports are published on
+    # the runner, where the test container reaches them as
+    # host.docker.internal.
+    services:
+      mailpit:
+        image: axllent/mailpit:v1.31.3
+        env:
+          MP_SMTP_AUTH_ACCEPT_ANY: 1
+          MP_SMTP_AUTH_ALLOW_INSECURE: 1
+        ports:
+          - 1025:1025
+          - 8025:8025
     permissions:
       contents: read
       packages: write
@@ -101,6 +115,10 @@ jobs:
       # tests/run-tests.sh runs tests/in-container.sh inside the image just
       # built; BWGC_IMAGE tells it to use that image rather than build its own.
       - name: Run the test suite
+        env:
+          BWGC_SMTP_HOST: host.docker.internal
+          BWGC_SMTP_PORT: 1025
+          BWGC_MAILPIT_API: http://host.docker.internal:8025
         run: BWGC_IMAGE="$TEST_IMAGE" ./tests/run-tests.sh
 
       # Login against a Docker registry

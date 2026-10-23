@@ -94,6 +94,15 @@ log_error() {
 
 ###### E-mail Functions ######################################################################
 
+# A .env from before SMTP was required ships BACKUP_EMAIL_NOTIFY=true with every
+# SMTP setting commented out. The setup below then reads an unset SMTP_HOST, and
+# set -u stops the script before it backs anything up. A notice that cannot be
+# sent must not cost the backup it was meant to report on.
+if [ "$BACKUP_EMAIL_NOTIFY" = "true" ] && [ -z "${SMTP_HOST:-}" ]; then
+  log "BACKUP_EMAIL_NOTIFY is true but SMTP_HOST is not set, so no e-mail will be sent. Set the SMTP settings in .env, or BACKUP_EMAIL_NOTIFY=false." "WARNING"
+  BACKUP_EMAIL_NOTIFY=false
+fi
+
 # Initialize e-mail if (using e-mail backup OR BACKUP_EMAIL_NOTIFY is set) AND ssmtp has not been configured
 if { [ "${1:-}" = "email" ] || [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; } && [ ! -f "$MUTTRC" ]; then
   # SMTP_SECURITY takes vaultwarden's values. Mutt 2 requires TLS unless told

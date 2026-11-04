@@ -27,7 +27,7 @@ on:
 
 jobs:
   build:
-    uses: dadatuputi/bwgc_workflows/.github/workflows/build-image.yml@32d16f94c39fd77b11b94c1017ad7e7463a1e0ba # v1.0.1
+    uses: dadatuputi/bwgc_workflows/.github/workflows/build-image.yml@ba3db05fc13164ec7af87552ec32a316a5fa6708 # v1.0.1
     with:
       test-image: bwgc_backup:test
       shellcheck: true

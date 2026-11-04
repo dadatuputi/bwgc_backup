@@ -5,7 +5,11 @@ FROM alpine:3.24
 # rclone comes from the Alpine community repository so apk verifies its
 # signature. Alpine's build can lag upstream; if a newer release is needed, pin
 # the version and verify its published SHA256.
-RUN apk add --no-cache \
+#
+# apk upgrade first: the base image's own packages (apk-tools, for one) can lag
+# the repository index, and the nightly rebuild only helps if it brings them up
+# to date too.
+RUN apk upgrade --no-cache && apk add --no-cache \
       docker-cli \
       curl \
       mutt \

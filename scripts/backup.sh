@@ -204,21 +204,17 @@ RCLONE=/usr/bin/rclone
 # Args:
 #   None
 # Behavior:
-#   Installs `rclone` into $RCLONE (used only if rclone missing). Typically a no-op
-#   because the Dockerfile installs rclone. Logs installation progress.
+#   Installs `rclone` from the Alpine repository (used only if rclone is
+#   missing). Typically a no-op because the Dockerfile installs rclone. Logs
+#   installation progress.
 # Returns:
 #   0 on success; non-zero on failure during installation.
 rclone_init() {
-  # Install rclone - https://wiki.alpinelinux.org/wiki/Rclone
-  # rclone install now handled in Dockerfile, so this function should never be executed
-  curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-  unzip rclone-current-linux-amd64.zip
-  cd rclone-*-linux-amd64 || return 1
-  cp rclone /usr/bin/
-  chown root:root $RCLONE
-  chmod 755 $RCLONE
+  # Take rclone from the Alpine repository, whose packages apk verifies, the
+  # same way the Dockerfile does, rather than an unchecked download.
+  apk add --no-cache rclone || return 1
 
-  log "$(printf "Rclone installed to %b" "$RCLONE")"
+  log "$(printf "Rclone installed to %b" "$(command -v rclone)")"
 }
 
 # rclone_prune

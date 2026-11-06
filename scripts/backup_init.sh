@@ -48,11 +48,15 @@ if [ -n "$BACKUP" ]; then
     printf "Adding status check crontab entry (%b)\n" "$CHECK_SCHEDULE" >> $LOG
   fi
 
-  crond -d 8;
   printf "Starting the cron daemon\n" >> $LOG
 
-  # Sleep indefinitely
-  tail -f /dev/null
+  crond -f -d 8 &
+  CROND=$!
+  trap 'kill -TERM "$CROND" 2>/dev/null; wait "$CROND"; exit 0' TERM INT
+  wait "$CROND"
+  STATUS=$?
+  printf "The cron daemon exited (status %s); stopping the container\n" "$STATUS" >> $LOG
+  exit "$STATUS"
 
 else
   printf "Backup is not configured, exiting\n" >> $LOG

@@ -1,5 +1,5 @@
 # Pinned to a minor version rather than :latest so a rebuild is reproducible and
-# a base image bump is a reviewable change. Renovate updates this line.
+# a base image bump is a reviewable change. Dependabot proposes the bump.
 FROM alpine:3.24
 
 # rclone comes from the Alpine community repository so apk verifies its

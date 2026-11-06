@@ -203,14 +203,11 @@ To restore, untar in the Bitwarden data directory:
 # Args:
 #   None
 # Behavior:
-#   Installs `rclone` from the Alpine repository (used only if rclone is
-#   missing). Typically a no-op because the Dockerfile installs rclone. Logs
-#   installation progress.
+#   Installs `rclone` with apk (used only if rclone is missing). Typically a
+#   no-op because the Dockerfile installs rclone. Logs installation progress.
 # Returns:
 #   0 on success; non-zero on failure during installation.
 rclone_init() {
-  # Take rclone from the Alpine repository, whose packages apk verifies, the
-  # same way the Dockerfile does, rather than an unchecked download.
   apk add --no-cache rclone || return 1
 
   log "$(printf "Rclone installed to %b" "$(command -v rclone)")"

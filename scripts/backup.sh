@@ -199,26 +199,18 @@ To restore, untar in the Bitwarden data directory:
 ###### Backup Functions ######################################################################
 
 
-RCLONE=/usr/bin/rclone
 # rclone_init
 # Args:
 #   None
 # Behavior:
-#   Installs `rclone` into $RCLONE (used only if rclone missing). Typically a no-op
-#   because the Dockerfile installs rclone. Logs installation progress.
+#   Installs `rclone` with apk (used only if rclone is missing). Typically a
+#   no-op because the Dockerfile installs rclone. Logs installation progress.
 # Returns:
 #   0 on success; non-zero on failure during installation.
 rclone_init() {
-  # Install rclone - https://wiki.alpinelinux.org/wiki/Rclone
-  # rclone install now handled in Dockerfile, so this function should never be executed
-  curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-  unzip rclone-current-linux-amd64.zip
-  cd rclone-*-linux-amd64 || return 1
-  cp rclone /usr/bin/
-  chown root:root $RCLONE
-  chmod 755 $RCLONE
+  apk add --no-cache rclone || return 1
 
-  log "$(printf "Rclone installed to %b" "$RCLONE")"
+  log "$(printf "Rclone installed to %b" "$(command -v rclone)")"
 }
 
 # rclone_prune

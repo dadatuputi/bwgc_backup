@@ -199,7 +199,6 @@ To restore, untar in the Bitwarden data directory:
 ###### Backup Functions ######################################################################
 
 
-RCLONE=/usr/bin/rclone
 # rclone_init
 # Args:
 #   None

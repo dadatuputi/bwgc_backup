@@ -1,10 +1,6 @@
-# Failures that used to be reported as successes. Each run here must exit
-# non-zero, and must leave no bw_backup_* archive that rclone would copy or
-# the status check would take for a fresh backup.
 unset BACKUP_ENCRYPTION_KEY 2>/dev/null || true
 no_smtp="SMTP_HOST=127.0.0.1 SMTP_PORT=1 SMTP_SECURITY=off SMTP_FROM=vault@example.com BACKUP_EMAIL_TO=admin@example.com METADATA_HOST=169.254.255.255"
 
-# The email method: an archive that was never sent is not a backup.
 reset_data
 rm -f /tmp/muttrc
 # shellcheck disable=SC2086
@@ -13,7 +9,6 @@ assert_status "$STATUS" 1 "email method fails when the mail cannot be sent"
 assert_contains "$OUT" "Could not e-mail the archive" "the failed send is named"
 assert_not_contains "$OUT" "Backup to email completed" "it is not reported as completed"
 
-# rclone: an unparsable configuration, then one with no remotes in it.
 reset_data
 printf 'not an rclone config\n' > /tmp/broken-rclone.conf
 OUT=$(BACKUP_RCLONE_CONF=/tmp/broken-rclone.conf sh /backup.sh rclone 2>&1); STATUS=$?
@@ -25,8 +20,6 @@ assert_status "$STATUS" 1 "rclone fails when no remote is configured"
 assert_contains "$OUT" "No remotes are configured" "the missing remote is named"
 rm -f /tmp/broken-rclone.conf /tmp/empty-rclone.conf
 
-# A tar that fails part way. The shim writes some bytes, as a tar that hit a
-# read error would, then fails.
 mkdir -p /tmp/shim
 printf '#!/bin/sh\nprintf partial\nexit 2\n' > /tmp/shim/tar
 chmod +x /tmp/shim/tar
@@ -41,21 +34,17 @@ assert_status "$STATUS" 1 "a plain backup fails when tar fails"
 assert_eq "$(ls -A /data/backups | grep -c 'bw_backup_')" 0 "no truncated archive is left behind"
 rm -rf /tmp/shim
 
-# A finished backup is still named bw_backup_* and leaves nothing else.
 reset_data
 sh /backup.sh local >/dev/null 2>&1
 assert_eq "$(ls -A /data/backups | grep -c '^bw_backup_')" 1 "a good backup is renamed into place"
 assert_eq "$(ls -A /data/backups | grep -c 'partial')" 0 "and leaves no partial file"
 
-# An alert that could not be sent is tried again at the next check.
 reset_data
 rm -f /data/backups/bw_backup_* /tmp/muttrc
 # shellcheck disable=SC2086
 env $no_smtp BACKUP_EMAIL_NOTIFY=true sh /backup.sh check >/dev/null 2>&1
 assert_no_file /data/backups/.last-status-alert "an unsent alert is not remembered as sent"
 
-# Mutt expands $, ` and \ inside double quotes, and " ends the string. The
-# password must reach mutt exactly as given.
 for pw in 'plain' 'has"quote' 'has`id`tick' 'has$HOME' 'back\slash' "it's"; do
 	rm -f /tmp/muttrc
 	env SMTP_HOST=mail.example.com SMTP_PORT=587 SMTP_SECURITY=starttls SMTP_USERNAME=user SMTP_PASSWORD="$pw" \

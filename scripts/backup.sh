@@ -132,9 +132,6 @@ set ssl_starttls=yes" ;;
   {
     printf '%s\n' "$MUTT_TLS"
     printf 'set smtp_url="%s"\n' "$SMTP_URL"
-    # Mutt expands $VARIABLES and `commands` inside double quotes, and a "
-    # ends the string, so a password holding any of them was mangled, or ran
-    # as a command. A backslash makes each one literal.
     [ -z "${SMTP_USERNAME:-}" ] || printf 'set smtp_pass="%s"\n' \
       "$(printf '%s' "${SMTP_PASSWORD:-}" | sed 's/[\\"`$]/\\&/g')"
   } >"$MUTTRC"
@@ -312,20 +309,11 @@ make_backup() {
     BACKUP_FILE=$BACKUP_FILE.aes256
   fi
 
-  # The archive is written under a name that does not match bw_backup_*, and
-  # renamed only once it is complete. A failed or interrupted run (a container
-  # stopped mid-backup) used to leave a truncated bw_backup_* file, which rclone
-  # then copied to every remote and the status check took as a fresh backup.
   PARTIAL_FILE="$BACKUP_DIR/.partial-$(basename "$BACKUP_FILE")"
   rm -f "$PARTIAL_FILE"
-  # A run killed outright leaves its partial file behind; clear old ones.
   find "$BACKUP_DIR" -type f -name '.partial-bw_backup_*' -mtime +0 -exec rm -f {} \;
 
   if [ -n "$BACKUP_ENCRYPTION_KEY" ]; then
-    # pipefail: without it the pipeline's status is openssl's alone, so a tar
-    # that failed part way still produced an encrypted, truncated archive
-    # reported as a success. This runs in the caller's $( ) subshell, so the
-    # option does not outlive the function.
     set -o pipefail
     # -pass env: keeps the key out of argv, which is readable from
     # /proc/<pid>/cmdline, and out of an expansion that would break on a key
@@ -397,8 +385,6 @@ backup(){
       if [ -n "$RESULT" ]; then
         FILENAME=$(basename $RESULT)
         BODY=$(email_body $FILENAME)
-        # The archive only reaches the operator if this mail is sent, so a
-        # failed send is a failed backup, not a success to report.
         if ! email_send "$SMTP_FROM_NAME - $FILENAME" "$BODY" $RESULT; then
           printf "Could not e-mail the archive to %s; see the e-mail error above" "$BACKUP_EMAIL_TO"
           return 1
@@ -435,9 +421,6 @@ backup(){
         PUSH_FAILED_CNT=0
         PUSH_ERROR_LOG=""
 
-        # A configuration rclone cannot parse, or one with no remotes in it,
-        # used to give an empty list, so nothing was copied and the backup
-        # was reported as a success.
         if ! REMOTES=$(rclone --config "$BACKUP_RCLONE_CONF" listremotes 2>&1); then
           printf "Could not read the rclone configuration %s:\n  %s" "$BACKUP_RCLONE_CONF" "$REMOTES"
           return 1
@@ -602,8 +585,6 @@ restore_backup() {
     
     # Decrypt and extract
     log "$(printf "Decrypting backup file %s..." "$BACKUP_FILE")"
-    # pipefail, so a decryption failure fails the restore even if tar does
-    # not notice the damage.
     set -o pipefail
     if ! BW_KEY="$DECRYPT_KEY" openssl enc -d -aes256 -salt -pbkdf2 -pass env:BW_KEY -in "$BACKUP_FILE" | tar xzf - -C "$RESTORE_TMP_DIR"; then
       log_error "Failed to decrypt or extract the backup file. Exiting"
@@ -882,8 +863,6 @@ check_status() {
   if [ "$LAST" = "$PROBLEMS" ]; then
     log "Same problems as the last check; not sending another e-mail."
   elif [ "$BACKUP_EMAIL_NOTIFY" = "true" ]; then
-    # Remembered only once sent, so an alert that could not be delivered is
-    # tried again at the next check rather than never.
     if email_send "${SMTP_FROM_NAME:-Bitwarden} - action needed" "$REPORT"; then
       printf '%s' "$PROBLEMS" > "$CHECK_STATE_FILE" 2>/dev/null || true
       log "Alert sent."
@@ -975,8 +954,6 @@ case "${1:-}" in
         # method has already sent it, with restore instructions, and the
         # other methods put it where they were asked to.
         BODY="Backup completed successfully via: $SUCCESSFUL_BACKUPS\n\nArchive: $RESULT"
-        # The backup itself succeeded; a notice that cannot be sent is logged
-        # by email_send and does not change that.
         email_send "$SMTP_FROM_NAME - Backup Successful" "$BODY" || true
       fi
     else

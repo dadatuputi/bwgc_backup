@@ -50,16 +50,6 @@ if [ -n "$BACKUP" ]; then
 
   printf "Starting the cron daemon\n" >> $LOG
 
-  # crond runs in the foreground, watched by this shell. Two things the old
-  # "crond -d 8; tail -f /dev/null" got wrong:
-  #   - if crond died, the container kept running with no scheduler, so
-  #     backups stopped and nothing restarted it. Now the container exits
-  #     with crond's status and the restart policy brings it back.
-  #   - PID 1 ignores SIGTERM unless it traps it, so every "docker stop"
-  #     (each Watchtower update) waited 10 seconds and then SIGKILLed the
-  #     container. A backup still running when the container stops is cut
-  #     off either way; backup.sh writes under a temporary name, so it
-  #     leaves no truncated archive behind.
   crond -f -d 8 &
   CROND=$!
   trap 'kill -TERM "$CROND" 2>/dev/null; wait "$CROND"; exit 0' TERM INT

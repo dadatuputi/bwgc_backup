@@ -752,7 +752,7 @@ restore_backup() {
 #   when running somewhere that is not GCE.
 metadata() {
   # METADATA_HOST is overridable so tests can simulate running outside GCE.
-  curl -s -m 5 -H "Metadata-Flavor: Google" \
+  curl -sf -m 5 -H "Metadata-Flavor: Google" \
     "http://${METADATA_HOST:-metadata.google.internal}/computeMetadata/v1/$1" 2>/dev/null
 }
 
@@ -825,6 +825,20 @@ check_status() {
 
 "
       case "$PROBLEMS" in *os-eol*) ;; *) PROBLEMS="$PROBLEMS os-newer-$NEWER" ;; esac
+    fi
+
+    # Milestone 117 and later only apply OS updates when this key says so.
+    if [ "$MILESTONE" -ge 117 ]; then
+      POLICY=$(metadata "instance/attributes/cos-update-strategy")
+      [ -n "$POLICY" ] || POLICY=$(metadata "project/attributes/cos-update-strategy")
+      if [ "$POLICY" != "update_enabled" ]; then
+        PROBLEMS="$PROBLEMS os-updates-off"
+        REPORT="$REPORT$(printf 'Automatic OS updates are off on this host (cos-update-strategy is %s).\n\nContainer-Optimized OS milestone 117 and later do not download OS updates\nunless the instance or project metadata says so, so this host gets no kernel,\ncontainerd or Docker patches and the update timer finds nothing to apply.\nTurn them on once, from Cloud Shell:\n\n    gcloud compute instances add-metadata <name> --zone <zone> --metadata cos-update-strategy=update_enabled\n' "${POLICY:-unset}")
+
+"
+      else
+        log "Automatic OS updates are enabled."
+      fi
     fi
   fi
 

@@ -871,7 +871,7 @@ check_status() {
         REPORT="$REPORT
 "
       else
-        log "$(printf "OS updates are arriving: newest build %s, host restarted since or within the grace period." "$L_NAME")"
+        log "$(printf "OS updates are arriving: newest build %s is %s days old, and the host restarted since or it is under 7." "$L_NAME" "$L_DAYS")"
       fi
     else
       log "Could not look up the newest build for this milestone; skipping the OS update check." "WARNING"

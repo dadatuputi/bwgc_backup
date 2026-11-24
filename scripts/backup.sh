@@ -751,10 +751,16 @@ restore_backup() {
 #   Queries the GCE metadata server. Returns empty on any failure, including
 #   when running somewhere that is not GCE.
 metadata() {
-  # METADATA_HOST is overridable so tests can simulate running outside GCE.
   curl -sf -m 5 -H "Metadata-Flavor: Google" \
-    "http://${METADATA_HOST:-metadata.google.internal}/computeMetadata/v1/$1" 2>/dev/null
+    "${METADATA_URL:-http://$METADATA_HOST/computeMetadata/v1}/$1" 2>/dev/null
 }
+
+gce_token() {
+  metadata "instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p'
+}
+
+COMPUTE_API=${COMPUTE_API:-https://compute.googleapis.com/compute/v1}
 
 # cos_family_status
 # Args:
@@ -768,11 +774,40 @@ metadata() {
 # Returns:
 #   Prints the HTTP status code.
 cos_family_status() {
-  _tok=$(metadata "instance/service-accounts/default/token" \
-    | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+  _tok=$(gce_token)
   [ -n "$_tok" ] || { printf '000'; return 1; }
   curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_tok" \
-    "https://compute.googleapis.com/compute/v1/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
+    "$COMPUTE_API/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
+}
+
+# iso_epoch
+#   Converts an RFC 3339 time such as 2026-11-10T10:23:45.123-08:00 to epoch seconds.
+iso_epoch() {
+  _t=$(printf '%s' "$1" | sed 's/\.[0-9]*//; s/Z$/+00:00/')
+  _base=${_t%[+-][0-9][0-9]:[0-9][0-9]}
+  _off=${_t#"$_base"}
+  _e=$(date -u -D '%Y-%m-%dT%H:%M:%S' -d "$_base" +%s 2>/dev/null) || return 1
+  case "$_off" in
+    [+-][0-9][0-9]:[0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  _h=$(printf '%s' "$_off" | cut -c2-3); _mi=$(printf '%s' "$_off" | cut -c5-6)
+  _s=$(( ${_h#0} * 3600 + ${_mi#0} * 60 ))
+  case "$_off" in -*) printf '%s' $((_e + _s)) ;; *) printf '%s' $((_e - _s)) ;; esac
+}
+
+# cos_family_latest
+#   Prints "<image name> <creation epoch>" for the newest build in cos-<m>-lts.
+cos_family_latest() {
+  _tok=$(gce_token)
+  [ -n "$_tok" ] || return 1
+  _json=$(curl -sf -m 8 -H "Authorization: Bearer $_tok" \
+    "$COMPUTE_API/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null | tr ',{}' '\n\n\n')
+  _name=$(printf '%s\n' "$_json" | sed -n 's/^ *"name" *: *"\([^"]*\)".*/\1/p' | head -1)
+  _ts=$(printf '%s\n' "$_json" | sed -n 's/^ *"creationTimestamp" *: *"\([^"]*\)".*/\1/p' | head -1)
+  _epoch=$(iso_epoch "$_ts") || return 1
+  [ -n "$_name" ] || return 1
+  printf '%s %s' "$_name" "$_epoch"
 }
 
 # check_status
@@ -827,18 +862,26 @@ check_status() {
       case "$PROBLEMS" in *os-eol*) ;; *) PROBLEMS="$PROBLEMS os-newer-$NEWER" ;; esac
     fi
 
-    # Milestone 117 and later only apply OS updates when this key says so.
-    if [ "$MILESTONE" -ge 117 ]; then
-      POLICY=$(metadata "instance/attributes/cos-update-strategy")
-      [ -n "$POLICY" ] || POLICY=$(metadata "project/attributes/cos-update-strategy")
-      if [ "$POLICY" != "update_enabled" ]; then
-        PROBLEMS="$PROBLEMS os-updates-off"
-        REPORT="$REPORT$(printf 'Automatic OS updates are off on this host (cos-update-strategy is %s).\n\nContainer-Optimized OS milestone 117 and later do not download OS updates\nunless the instance or project metadata says so, so this host gets no kernel,\ncontainerd or Docker patches and the update timer finds nothing to apply.\nTurn them on once, from Cloud Shell:\n\n    gcloud compute instances add-metadata <name> --zone <zone> --metadata cos-update-strategy=update_enabled\n' "${POLICY:-unset}")
+    # A host that applies updates restarts into them, so one that has not
+    # restarted since a build older than a week is not getting them.
+    LATEST=$(cos_family_latest "$MILESTONE")
+    if [ -n "$LATEST" ]; then
+      L_NAME=${LATEST% *}; L_EPOCH=${LATEST#* }
+      NOW=$(date +%s)
+      BOOT=$((NOW - $(cut -d. -f1 "${PROC_UPTIME:-/proc/uptime}")))
+      L_DAYS=$(( (NOW - L_EPOCH) / 86400 ))
+      if [ "$BOOT" -lt "$L_EPOCH" ] && [ "$L_DAYS" -ge 7 ]; then
+        POLICY=$(metadata "instance/attributes/cos-update-strategy")
+        [ -n "$POLICY" ] || POLICY=$(metadata "project/attributes/cos-update-strategy")
+        PROBLEMS="$PROBLEMS os-updates-stalled"
+        REPORT="$REPORT$(printf 'OS updates are not reaching this host.\n\nThe newest cos-%s-lts build, %s, came out %s days ago, but this host has\nnot restarted since before then, so it still runs an older build without its\nkernel, containerd or Docker patches.\n\nThe current setup downloads updates and restarts into them through\ncos-update-reboot.timer. If this host predates that timer, add it with\n./utilities/install-cos-update-reboot.sh. Also make sure updates are enabled\n(cos-update-strategy is %s), from Cloud Shell:\n\n    gcloud compute instances add-metadata <name> --zone <zone> --metadata cos-update-strategy=update_enabled\n' "$MILESTONE" "$L_NAME" "$L_DAYS" "${POLICY:-unset}")
 
 "
       else
-        log "Automatic OS updates are enabled."
+        log "$(printf "OS updates are arriving: newest build %s, host restarted since or within the grace period." "$L_NAME")"
       fi
+    else
+      log "Could not look up the newest build for this milestone; skipping the OS update check." "WARNING"
     fi
   fi
 

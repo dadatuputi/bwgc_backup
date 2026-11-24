@@ -780,22 +780,6 @@ cos_family_status() {
     "$COMPUTE_API/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null
 }
 
-# iso_epoch
-#   Converts an RFC 3339 time such as 2026-11-10T10:23:45.123-08:00 to epoch seconds.
-iso_epoch() {
-  _t=$(printf '%s' "$1" | sed 's/\.[0-9]*//; s/Z$/+00:00/')
-  _base=${_t%[+-][0-9][0-9]:[0-9][0-9]}
-  _off=${_t#"$_base"}
-  _e=$(date -u -D '%Y-%m-%dT%H:%M:%S' -d "$_base" +%s 2>/dev/null) || return 1
-  case "$_off" in
-    [+-][0-9][0-9]:[0-9][0-9]) ;;
-    *) return 1 ;;
-  esac
-  _h=$(printf '%s' "$_off" | cut -c2-3); _mi=$(printf '%s' "$_off" | cut -c5-6)
-  _s=$(( ${_h#0} * 3600 + ${_mi#0} * 60 ))
-  case "$_off" in -*) printf '%s' $((_e + _s)) ;; *) printf '%s' $((_e - _s)) ;; esac
-}
-
 # cos_family_latest
 #   Prints "<image name> <creation epoch>" for the newest build in cos-<m>-lts.
 cos_family_latest() {
@@ -805,7 +789,8 @@ cos_family_latest() {
     "$COMPUTE_API/projects/cos-cloud/global/images/family/cos-$1-lts" 2>/dev/null | tr ',{}' '\n\n\n')
   _name=$(printf '%s\n' "$_json" | sed -n 's/^ *"name" *: *"\([^"]*\)".*/\1/p' | head -1)
   _ts=$(printf '%s\n' "$_json" | sed -n 's/^ *"creationTimestamp" *: *"\([^"]*\)".*/\1/p' | head -1)
-  _epoch=$(iso_epoch "$_ts") || return 1
+  # Only the date matters, so the UTC offset is ignored.
+  _epoch=$(date -u -D '%Y-%m-%dT%H:%M:%S' -d "$(printf '%s' "$_ts" | cut -c1-19)" +%s 2>/dev/null) || return 1
   [ -n "$_name" ] || return 1
   printf '%s %s' "$_name" "$_epoch"
 }

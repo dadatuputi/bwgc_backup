@@ -856,11 +856,19 @@ check_status() {
       BOOT=$((NOW - $(cut -d. -f1 "${PROC_UPTIME:-/proc/uptime}")))
       L_DAYS=$(( (NOW - L_EPOCH) / 86400 ))
       if [ "$BOOT" -lt "$L_EPOCH" ] && [ "$L_DAYS" -ge 7 ]; then
-        POLICY=$(metadata "instance/attributes/cos-update-strategy")
-        [ -n "$POLICY" ] || POLICY=$(metadata "project/attributes/cos-update-strategy")
         PROBLEMS="$PROBLEMS os-updates-stalled"
-        REPORT="$REPORT$(printf 'OS updates are not reaching this host.\n\nThe newest cos-%s-lts build, %s, came out %s days ago, but this host has\nnot restarted since before then, so it still runs an older build without its\nkernel, containerd or Docker patches.\n\nThe current setup downloads updates and restarts into them through\ncos-update-reboot.timer. If this host predates that timer, add it with\n./utilities/install-cos-update-reboot.sh. Also make sure updates are enabled\n(cos-update-strategy is %s), from Cloud Shell:\n\n    gcloud compute instances add-metadata <name> --zone <zone> --metadata cos-update-strategy=update_enabled\n' "$MILESTONE" "$L_NAME" "$L_DAYS" "${POLICY:-unset}")
-
+        REPORT="$REPORT$(printf 'OS updates are not reaching this host.\n\nThe newest cos-%s-lts build, %s, came out %s days ago, but this host has\nnot restarted since before then, so it still runs an older build without its\nkernel, containerd or Docker patches.\n\nThe current setup downloads updates and restarts into them through\ncos-update-reboot.timer. If this host predates that timer, add it with\n./utilities/install-cos-update-reboot.sh.\n' "$MILESTONE" "$L_NAME" "$L_DAYS")
+"
+        # Milestone 117 and later only apply OS updates when this key says so.
+        if [ "$MILESTONE" -ge 117 ]; then
+          POLICY=$(metadata "instance/attributes/cos-update-strategy")
+          [ -n "$POLICY" ] || POLICY=$(metadata "project/attributes/cos-update-strategy")
+          if [ "$POLICY" != "update_enabled" ]; then
+            REPORT="$REPORT$(printf '\ncos-update-strategy is %s. Set it so updates do not depend on the timer, from Cloud Shell:\n\n    gcloud compute instances add-metadata <name> --zone <zone> --metadata cos-update-strategy=update_enabled\n' "${POLICY:-unset}")
+"
+          fi
+        fi
+        REPORT="$REPORT
 "
       else
         log "$(printf "OS updates are arriving: newest build %s, host restarted since or within the grace period." "$L_NAME")"
